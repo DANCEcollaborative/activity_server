@@ -1,0 +1,590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JupyterLab Bot Chat</title>
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+            text-align: center;
+            font-size: 28px;
+        }
+
+        /* Adjusted Auth Section to only hold info/login button */
+        .auth-section {
+            margin-bottom: 24px;
+        }
+
+        .user-info {
+            background: #f0f4ff;
+            border-left: 4px solid #667eea;
+            padding: 15px;
+            border-radius: 4px;
+            margin-bottom: 20px;
+        }
+
+        .user-info h3 {
+            color: #333;
+            margin-bottom: 5px;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .user-info p {
+            color: #555;
+            margin: 2px 0;
+            font-size: 14px;
+        }
+
+        .google-btn {
+            width: 100%;
+            padding: 14px;
+            background: white;
+            color: #444;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+        }
+
+        .google-btn:hover {
+            border-color: #4285f4;
+            background: #f8f9fa;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(66, 133, 244, 0.2);
+        }
+
+        .google-btn svg {
+            width: 20px;
+            height: 20px;
+        }
+
+        /* LOGOUT BUTTON - Bolder font added */
+        .logout-btn {
+            background: transparent;
+            color: #999;
+            border: none;
+            font-size: 13px;
+            font-weight: 700; /* Made bolder */
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-top: 30px; /* Push to bottom */
+            align-self: center;
+            text-decoration: none;
+            padding: 5px 10px;
+        }
+
+        .logout-btn:hover {
+            color: #dc3545; /* Red only on hover */
+            text-decoration: underline;
+            transform: none;
+            background: transparent;
+        }
+
+        .form-group {
+            margin-bottom: 24px;
+        }
+
+        label {
+            display: block;
+            color: #555;
+            font-weight: 600;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+
+        select {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+            background-color: #fff;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        button.start-btn {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            margin-top: 5px;
+        }
+
+        button.start-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        button.start-btn:active {
+            transform: translateY(0);
+        }
+
+        button.start-btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status {
+            margin-top: 20px;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            display: none;
+            text-align: center;
+        }
+
+        .status.show {
+            display: block;
+        }
+
+        .status.loading {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+
+        .status.success {
+            background: #e8f5e9;
+            color: #388e3c;
+        }
+
+        .status.error {
+            background: #ffebee;
+            color: #d32f2f;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* Google Sign-In button container */
+        #g_id_onload {
+            display: flex;
+            justify-content: center;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>JupyterLab Bot Chat</h1>
+        
+        <div class="auth-section">
+            <!-- <div id="loggedOut"> -->
+            <div id="loggedOut" class="hidden">
+                <!-- Google Sign-In Button -->
+                <div id="g_id_onload"
+                     data-client_id="683742022812-5b3ohko5co4pi8dbh5rpdsm085fjhp14.apps.googleusercontent.com"
+                     data-callback="handleCredentialResponse"
+                     data-auto_prompt="false">
+                </div>
+                <div class="g_id_signin" 
+                     data-type="standard" 
+                     data-size="large" 
+                     data-theme="outline" 
+                     data-text="sign_in_with"
+                     data-shape="rectangular"
+                     data-logo_alignment="left"
+                     data-width="400">
+                </div>
+            </div>
+
+            <div id="loggedIn" class="hidden">
+                <div class="user-info">
+                    <h3>Account</h3>
+                    <p><strong>Name:</strong> <span id="userName"></span></p>
+                    <p><strong>Email:</strong> <span id="userEmail"></span></p>
+                </div>
+            </div>
+        </div>
+
+        <div id="jupyterForm" class="hidden">
+            <div class="form-group">
+                <label for="course">Select Course</label>
+                <select id="course">
+                    <option value="">-- Loading courses... --</option>
+                </select>
+            </div>
+
+            <button class="start-btn" id="startBtn">Start JupyterLab</button>
+
+            <div id="status" class="status"></div>
+        </div>
+
+        <button class="logout-btn hidden" id="logoutBtn">Sign out</button>
+    </div>
+<script>
+        // ====== CONFIGURATION - UPDATE THESE VALUES ======
+        const API_BASE_URL = 'http://localhost:8100'; // Your activity server URL
+        const GOOGLE_CLIENT_ID = '683742022812-5b3ohko5co4pi8dbh5rpdsm085fjhp14.apps.googleusercontent.com';
+        const JUPYTER_SERVER = 'https://bazaar.lti.cs.cmu.edu';
+        // ==================================================
+
+        // DOM elements
+        const loggedOutDiv = document.getElementById('loggedOut');
+        const loggedInDiv = document.getElementById('loggedIn');
+        const jupyterForm = document.getElementById('jupyterForm');
+        const logoutBtn = document.getElementById('logoutBtn');
+        const startBtn = document.getElementById('startBtn');
+        const status = document.getElementById('status');
+        const userNameSpan = document.getElementById('userName');
+        const userEmailSpan = document.getElementById('userEmail');
+        const courseSelect = document.getElementById('course');
+
+        let currentUser = null;
+        let availableActivities = [];
+
+        // Utility functions
+        function showStatus(message, type) {
+            status.textContent = message;
+            status.className = 'status show ' + type;
+        }
+
+        function hideStatus() {
+            status.className = 'status';
+        }
+
+        function showLoggedIn(user) {
+            loggedOutDiv.classList.add('hidden');
+            loggedInDiv.classList.remove('hidden');
+            jupyterForm.classList.remove('hidden');
+            logoutBtn.classList.remove('hidden');
+            
+            userNameSpan.textContent = user.name;
+            userEmailSpan.textContent = user.email;
+        }
+
+        function showLoggedOut() {
+            loggedOutDiv.classList.remove('hidden');
+            loggedInDiv.classList.add('hidden');
+            jupyterForm.classList.add('hidden');
+            logoutBtn.classList.add('hidden');
+            
+            currentUser = null;
+            availableActivities = [];
+            courseSelect.innerHTML = '<option value="">-- Loading courses... --</option>';
+        }
+
+        // Parse JWT token to get user info
+        function parseJwt(token) {
+            try {
+                const base64Url = token.split('.')[1];
+                const base64 = base64Url.replace(/-/g, '+').replace(/_/g, '/');
+                const jsonPayload = decodeURIComponent(atob(base64).split('').map(c => {
+                    return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+                }).join(''));
+                return JSON.parse(jsonPayload);
+            } catch (error) {
+                console.error('Error parsing JWT:', error);
+                return null;
+            }
+        }
+
+        // Handle Google Sign-In
+        function handleCredentialResponse(response) {
+            try {
+                // Decode JWT token to get user info
+                const userInfo = parseJwt(response.credential);
+                
+                if (!userInfo) {
+                    throw new Error('Failed to parse user info');
+                }
+                
+                currentUser = {
+                    email: userInfo.email,
+                    name: userInfo.name,
+                    picture: userInfo.picture
+                };
+                
+                console.log('User logged in:', currentUser);
+                
+                // Update UI
+                showLoggedIn(currentUser);
+                
+                // Load user's courses from database
+                loadUserCourses();
+                
+            } catch (error) {
+                console.error('Error handling credential:', error);
+                showStatus('❌ Error signing in. Please try again.', 'error');
+            }
+        }
+
+        // Initialize Google Sign-In
+        function initializeGoogleSignIn() {
+            if (typeof google === 'undefined' || !google.accounts) {
+                console.error('Google Sign-In library not loaded');
+                setTimeout(initializeGoogleSignIn, 100);
+                return;
+            }
+            
+            console.log('Initializing Google Sign-In...');
+            
+            google.accounts.id.initialize({
+                client_id: "683742022812-5b3ohko5co4pi8dbh5rpdsm085fjhp14.apps.googleusercontent.com",
+                callback: handleCredentialResponse
+            });
+            
+            // Render the sign-in button
+            const buttonDiv = document.querySelector('.g_id_signin');
+            if (buttonDiv) {
+                google.accounts.id.renderButton(
+                    buttonDiv,
+                    {
+                        theme: 'outline',
+                        size: 'large',
+                        text: 'signin_with',
+                        shape: 'rectangular',
+                        logo_alignment: 'left',
+                        width: 400
+                    }
+                );
+                console.log('Google Sign-In button rendered');
+            } else {
+                console.error('Button container not found');
+            }
+        }
+
+        // Load courses for logged-in user from database
+        async function loadUserCourses() {
+            courseSelect.innerHTML = '<option value="">-- Loading courses... --</option>';
+            courseSelect.disabled = true;
+            hideStatus();
+            
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/activities/by-email/${encodeURIComponent(currentUser.email)}`);
+                
+                if (!response.ok) {
+                    throw new Error('Failed to load courses from database');
+                }
+                
+                const data = await response.json();
+                availableActivities = data.activities || [];
+                
+                courseSelect.disabled = false;
+                
+                if (availableActivities.length === 0) {
+                    courseSelect.innerHTML = '<option value="">-- No courses available --</option>';
+                    showStatus("Sorry. You aren't signed up for any course activities.", 'error');
+                } else {
+                    // Populate dropdown with activity_name, but store activity_id as value
+                    courseSelect.innerHTML = '<option value="">-- Select a course --</option>';
+                    availableActivities.forEach(activity => {
+                        const option = document.createElement('option');
+                        option.value = activity.activity_id;  // Store activity_id
+                        option.textContent = activity.activity_name;  // Display activity_name
+                        courseSelect.appendChild(option);
+                    });
+                }
+                
+            } catch (error) {
+                console.error('Error loading courses:', error);
+                courseSelect.disabled = false;
+                courseSelect.innerHTML = '<option value="">-- Error loading courses --</option>';
+                showStatus('❌ Error loading courses from database. Please refresh and try again.', 'error');
+            }
+        }
+
+        // Logout
+        logoutBtn.addEventListener('click', () => {
+            showLoggedOut();
+            hideStatus();
+            // Sign out from Google
+            if (google && google.accounts) {
+                google.accounts.id.disableAutoSelect();
+            }
+        });
+
+        // Start JupyterLab
+        startBtn.addEventListener('click', async () => {
+            if (!currentUser) {
+                showStatus('❌ Please sign in first', 'error');
+                return;
+            }
+
+            const activityId = courseSelect.value;  // Get activity_id from selected option
+            
+            if (!activityId) {
+                showStatus('❌ Please select a course', 'error');
+                return;
+            }
+
+            // Open window immediately to avoid popup blocker
+            const newWindow = window.open('about:blank', '_blank');
+            
+            if (!newWindow || newWindow.closed || typeof newWindow.closed === 'undefined') {
+                showStatus('❌ Popup was blocked. Please allow popups for this site.', 'error');
+                return;
+            }
+
+            // Show loading page in the new window
+            newWindow.document.write(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Loading JupyterLab...</title>
+                    <style>
+                        body {
+                            font-family: 'Segoe UI', sans-serif;
+                            display: flex;
+                            justify-content: center;
+                            align-items: center;
+                            height: 100vh;
+                            margin: 0;
+                            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                            color: white;
+                        }
+                        .loader {
+                            text-align: center;
+                        }
+                        .spinner {
+                            border: 4px solid rgba(255,255,255,0.3);
+                            border-top: 4px solid white;
+                            border-radius: 50%;
+                            width: 50px;
+                            height: 50px;
+                            animation: spin 1s linear infinite;
+                            margin: 0 auto 20px;
+                        }
+                        @keyframes spin {
+                            0% { transform: rotate(0deg); }
+                            100% { transform: rotate(360deg); }
+                        }
+                    </style>
+                </head>
+                <body>
+                    <div class="loader">
+                        <div class="spinner"></div>
+                        <h2>Starting JupyterLab...</h2>
+                        <p>This may take up to 5 minutes</p>
+                    </div>
+                </body>
+                </html>
+            `);
+
+            startBtn.disabled = true;
+            showStatus('⏳ Starting JupyterLab... This may take up to 5 minutes.', 'loading');
+
+            // Use activity_id (e.g., "python101") as entityId for JupyterLab
+            const requestBody = {
+                name: currentUser.name,   
+                email: currentUser.email, 
+                password: currentUser.email, 
+                entityId: activityId  // Use activity_id from database
+            };
+
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5 * 60 * 1000);
+
+                const response = await fetch(`${JUPYTER_SERVER}/getJupyterlabUrl`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify(requestBody),
+                    signal: controller.signal
+                });
+
+                clearTimeout(timeoutId);
+
+                if (!response.ok) {
+                    throw new Error(`Server responded with status: ${response.status}`);
+                }
+
+                const contentType = response.headers.get('content-type');
+                let url = null;
+                
+                if (contentType && contentType.includes('application/json')) {
+                    const data = await response.json();
+                    if (data.url) {
+                        url = data.url;
+                    } else if (data.jupyterlabUrl) {
+                        url = data.jupyterlabUrl;
+                    }
+                } else {
+                    url = await response.text();
+                    url = url.trim();
+                }
+
+                if (url && url.startsWith('http')) {
+                    showStatus('✅ Success! Opening JupyterLab...', 'success');
+                    newWindow.location.href = url;
+                } else {
+                    newWindow.close();
+                    showStatus('❌ No valid URL received from server', 'error');
+                }
+
+            } catch (error) {
+                newWindow.close();
+                if (error.name === 'AbortError') {
+                    showStatus('❌ Request timed out after 5 minutes', 'error');
+                } else {
+                    showStatus(`❌ Error: ${error.message}`, 'error');
+                }
+            } finally {
+                startBtn.disabled = false;
+            }
+        });
+
+        // Initialize when page loads
+        window.addEventListener('load', () => {
+            console.log('Page loaded, initializing...');
+            showLoggedOut(); 
+            initializeGoogleSignIn();
+        });
+
+        // Make handleCredentialResponse globally available
+        window.handleCredentialResponse = handleCredentialResponse;
+    </script>
+
+</body>
+</html>

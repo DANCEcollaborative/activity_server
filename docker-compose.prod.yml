@@ -1,0 +1,147 @@
+version: '3.8'
+
+# Production Docker Compose configuration
+# Use with: docker compose -f docker-compose.prod.yml up -d
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: activity_db_prod
+    restart: always
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups
+    # Don't expose port externally in production
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - activity_network
+    # Security: Run as non-root user
+    user: postgres
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+  # Activity Server Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: activity_app_prod
+    restart: always
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      # Production settings
+      WORKERS: 4
+      LOG_LEVEL: warning
+    # Only expose internally, use nginx as reverse proxy
+    expose:
+      - "8100"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount Docker socket for activity containers (read-only for security)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Logs
+      - ./logs:/app/logs
+    networks:
+      - activity_network
+    command: >
+      sh -c "
+      echo 'Initializing database...' &&
+      python -c 'from models import db; db.create_tables()' &&
+      echo 'Starting production server...' &&
+      uvicorn main:app --host 0.0.0.0 --port 8100 --workers 4 --log-level warning
+      "
+    # Security: Run as non-root user
+    user: "1000:1000"
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 512M
+
+  # Nginx Reverse Proxy (for SSL termination and security)
+  nginx:
+    image: nginx:alpine
+    container_name: activity_nginx_prod
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - nginx_cache:/var/cache/nginx
+    depends_on:
+      - app
+    networks:
+      - activity_network
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+
+  # Automated backups
+  backup:
+    image: postgres:15-alpine
+    container_name: activity_backup
+    restart: "no"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ./backups:/backups
+    networks:
+      - activity_network
+    entrypoint: /bin/sh
+    command: >
+      -c "
+      while true; do
+        echo 'Running backup at $(date)'
+        pg_dump -h db -U ${POSTGRES_USER} ${POSTGRES_DB} > /backups/backup_$(date +%Y%m%d_%H%M%S).sql
+        echo 'Backup completed'
+        # Keep only last 7 days of backups
+        find /backups -name 'backup_*.sql' -mtime +7 -delete
+        # Wait 24 hours
+        sleep 86400
+      done
+      "
+    profiles:
+      - backup
+
+volumes:
+  postgres_data:
+    driver: local
+  nginx_cache:
+    driver: local
+
+networks:
+  activity_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
