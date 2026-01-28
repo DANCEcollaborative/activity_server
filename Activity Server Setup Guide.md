@@ -351,7 +351,7 @@ open http://localhost:3000
 | API Docs | http://localhost:8100/docs | Interactive API documentation |
 | Instructor Dashboard | http://localhost:8100/dashboard | Instructor interface |
 | Student Portal | http://localhost:3000 | Student sign-in and course selection |
-| Database | localhost:5432 | PostgreSQL (internal) |
+| Database | localhost:5433 | PostgreSQL (internal) |
 | pgAdmin | http://localhost:5050 | Database management UI (optional) |
 
 ## Common Commands
@@ -429,7 +429,7 @@ docker compose logs
 # Check if ports are available
 sudo lsof -i :8100
 sudo lsof -i :3000
-sudo lsof -i :5432
+sudo lsof -i :5433
 
 # Remove containers and try again
 docker compose down -v

@@ -45,7 +45,7 @@ Access the server at:
          ▼
 ┌─────────────────┐     ┌──────────────┐
 │  FastAPI App    │────▶│  PostgreSQL  │
-│   (Port 8100)   │     │   (Port 5432)│
+│   (Port 8100)   │     │   (Port 5433)│
 └─────────────────┘     └──────────────┘
          │
          ▼
@@ -254,7 +254,7 @@ docker compose logs
 
 # Check if ports are available
 sudo lsof -i :8100
-sudo lsof -i :5432
+sudo lsof -i :5433
 ```
 
 ### Database connection errors
