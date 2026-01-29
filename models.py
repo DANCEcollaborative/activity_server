@@ -37,7 +37,7 @@ class UserSubmission(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     activity_id = Column(String, ForeignKey('activities.activity_id'))
-    user = Column(String, nullable=False)
+    username = Column(String, nullable=False)
     name = Column(String, nullable=False)
     email = Column(String, nullable=True)  # User email for Google OAuth
     prequiz_token = Column(String, nullable=True)  # Pre-quiz token
