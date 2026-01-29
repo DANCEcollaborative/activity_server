@@ -30,10 +30,11 @@ from models import db, Activity, UserSubmission, Instructor
 
 # Initialize FastAPI
 app = FastAPI(title="Activity Server API", version="1.0.0")
+
 # CORS middleware for portal access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8100", "https://bazaar.lti.cs.cmu.edu", "https://bazaar.lti.cs.cmu.edu:3000", "https://bazaar.lti.cs.cmu.edu:8100", "https://bree.lti.cs.cmu.edu", "https://bree.lti.cs.cmu.edu:3000", "https://bree.lti.cs.cmu.edu:8100"]
+    allow_origins=["http://localhost:3000", "http://localhost:8100", "https://bazaar.lti.cs.cmu.edu", "https://bazaar.lti.cs.cmu.edu:3000", "https://bazaar.lti.cs.cmu.edu:8100", "https://bree.lti.cs.cmu.edu", "https://bree.lti.cs.cmu.edu:3000", "https://bree.lti.cs.cmu.edu:8100"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
