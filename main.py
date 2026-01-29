@@ -61,7 +61,7 @@ def get_db():
 
 # Pydantic models for API
 class SubmissionCreate(BaseModel):
-    user: str
+    username: str
     name: str
     activity: str
     email: Optional[str] = None
@@ -80,7 +80,7 @@ class InstructorCreate(BaseModel):
 
 class ScoreUpdate(BaseModel):
     activity_id: str
-    user: str
+    username: str
     score: float
 
 # Helper functions
@@ -141,7 +141,7 @@ def root():
 # Submission API
 @app.post("/api/submit")
 async def submit_assignment(
-    user: str = Form(...),
+    username: str = Form(...),
     name: str = Form(...),
     activity: str = Form(...),
     email: Optional[str] = Form(None),
@@ -163,7 +163,7 @@ async def submit_assignment(
     # Check if submission already exists
     existing = session.query(UserSubmission).filter(
         UserSubmission.activity_id == activity,
-        UserSubmission.user == user
+        UserSubmission.username == username
     ).first()
     
     if existing:
@@ -179,7 +179,7 @@ async def submit_assignment(
         # Create new submission
         submission = UserSubmission(
             activity_id=activity,
-            user=user,
+            username=username,
             name=name,
             email=email,
             prequiz_token=prequiz_token,
@@ -191,7 +191,7 @@ async def submit_assignment(
     
     session.commit()
     
-    return {"status": "success", "message": "Submission received", "user": user, "activity": activity}
+    return {"status": "success", "message": "Submission received", "username": username, "activity": activity}
 
 # Add activity
 @app.post("/api/activity")
@@ -286,7 +286,7 @@ async def update_score(
     
     submission = session.query(UserSubmission).filter(
         UserSubmission.activity_id == data.activity_id,
-        UserSubmission.user == data.user
+        UserSubmission.username == data.username
     ).first()
     
     if not submission:
@@ -295,7 +295,7 @@ async def update_score(
     submission.score = data.score
     session.commit()
     
-    return {"status": "success", "activity": data.activity_id, "user": data.user, "score": data.score}
+    return {"status": "success", "activity": data.activity_id, "username": data.username, "score": data.score}
 
 # Get activities by user email
 @app.get("/api/activities/by-email/{email}")
@@ -455,7 +455,7 @@ async def instructor_dashboard(
         <table>
             <tr>
                 <th>Name</th>
-                <th>User</th>
+                <th>Username</th>
                 <th>Email</th>
                 <th>Score</th>
                 <th>Notebook</th>
@@ -468,10 +468,10 @@ async def instructor_dashboard(
             html += f"""
             <tr>
                 <td>{submission.name}</td>
-                <td>{submission.user}</td>
+                <td>{submission.username}</td>
                 <td>{email_display}</td>
                 <td>{score_display}</td>
-                <td><a href="/download/{activity.activity_id}/{submission.user}?token={token}">Download</a></td>
+                <td><a href="/download/{activity.activity_id}/{submission.username}?token={token}">Download</a></td>
             </tr>
             """
         
@@ -723,10 +723,10 @@ async def instructor_logout():
     return response
 
 # Download notebook endpoint
-@app.get("/download/{activity_id}/{user}")
+@app.get("/download/{activity_id}/{username}")
 async def download_notebook(
     activity_id: str,
-    user: str,
+    username: str,
     token: str = None,
     session: Session = Depends(get_db)
 ):
@@ -755,7 +755,7 @@ async def download_notebook(
     # Get submission
     submission = session.query(UserSubmission).filter(
         UserSubmission.activity_id == activity_id,
-        UserSubmission.user == user
+        UserSubmission.username == username
     ).first()
     
     if not submission:
@@ -799,7 +799,7 @@ class UserSubmission(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     activity_id = Column(String, ForeignKey('activities.activity_id'))
-    user = Column(String, nullable=False)
+    username = Column(String, nullable=False)
     name = Column(String, nullable=False)
     email = Column(String, nullable=True)  # User email for Google OAuth
     prequiz_token = Column(String, nullable=True)  # Pre-quiz token
