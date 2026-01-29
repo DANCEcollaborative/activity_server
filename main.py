@@ -30,7 +30,6 @@ from models import db, Activity, UserSubmission, Instructor
 
 # Initialize FastAPI
 app = FastAPI(title="Activity Server API", version="1.0.0")
-,
 # CORS middleware for portal access
 app.add_middleware(
     CORSMiddleware,
