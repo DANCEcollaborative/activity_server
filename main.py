@@ -1,14 +1,4 @@
 """
-Database models for the activity server
-Install: pip install sqlalchemy psycopg2-binary
-"""
-
-from sqlalchemy import create_engine, Column, String, Integer, ForeignKey, LargeBinary, Float, Table, Boolean
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, sessionmaker
-from datetime import datetime
-import os
-"""
 Main FastAPI application for the activity server
 Install: pip install fastapi uvicorn python-multipart pydantic
 
@@ -26,7 +16,8 @@ import io
 import os
 import base64
 import json
-from models import db, Activity, UserSubmission, Instructor
+from datetime import datetime
+from models import db, Activity, UserSubmission, Instructor, Notebook
 
 # Initialize FastAPI
 app = FastAPI(title="Activity Server API", version="1.0.0")
@@ -61,7 +52,7 @@ def get_db():
 
 # Pydantic models for API
 class SubmissionCreate(BaseModel):
-    username: str
+    user: str
     name: str
     activity: str
     email: Optional[str] = None
@@ -80,7 +71,7 @@ class InstructorCreate(BaseModel):
 
 class ScoreUpdate(BaseModel):
     activity_id: str
-    username: str
+    user: str
     score: float
 
 # Helper functions
@@ -141,7 +132,7 @@ def root():
 # Submission API
 @app.post("/api/submit")
 async def submit_assignment(
-    username: str = Form(...),
+    user: str = Form(...),
     name: str = Form(...),
     activity: str = Form(...),
     email: Optional[str] = Form(None),
@@ -160,38 +151,51 @@ async def submit_assignment(
     # Read notebook content
     notebook_content = await notebook.read()
     
-    # Check if submission already exists
+    # Check if user submission exists
     existing = session.query(UserSubmission).filter(
         UserSubmission.activity_id == activity,
-        UserSubmission.username == username
+        UserSubmission.username == user
     ).first()
     
     if existing:
-        # Update existing submission
+        # Update existing user submission
         existing.name = name
         existing.email = email
         existing.prequiz_token = prequiz_token
         existing.postquiz_token = postquiz_token
-        existing.notebook = notebook_content
-        existing.notebook_filename = notebook.filename
-        existing.score = None  # Reset score on resubmission
     else:
-        # Create new submission
+        # Create new user submission
         submission = UserSubmission(
             activity_id=activity,
-            username=username,
+            username=user,
             name=name,
             email=email,
             prequiz_token=prequiz_token,
-            postquiz_token=postquiz_token,
-            notebook=notebook_content,
-            notebook_filename=notebook.filename
+            postquiz_token=postquiz_token
         )
         session.add(submission)
+        session.flush()  # Get the ID
+        existing = submission
+    
+    # Create new notebook entry
+    new_notebook = Notebook(
+        user_submission_id=existing.id,
+        notebook=notebook_content,
+        notebook_filename=notebook.filename,
+        submitted_at=datetime.utcnow().isoformat(),
+        score=None
+    )
+    session.add(new_notebook)
     
     session.commit()
     
-    return {"status": "success", "message": "Submission received", "username": username, "activity": activity}
+    return {
+        "status": "success", 
+        "message": "Submission received", 
+        "user": user, 
+        "activity": activity,
+        "notebook_id": new_notebook.id
+    }
 
 # Add activity
 @app.post("/api/activity")
@@ -282,20 +286,35 @@ async def update_score(
     data: ScoreUpdate,
     session: Session = Depends(get_db)
 ):
-    """Update the score for a user's submission"""
+    """Update the score for a user's most recent submission"""
     
+    # Get the user submission
     submission = session.query(UserSubmission).filter(
         UserSubmission.activity_id == data.activity_id,
-        UserSubmission.username == data.username
+        UserSubmission.username == data.user
     ).first()
     
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
     
-    submission.score = data.score
+    # Get the most recent notebook for this submission
+    latest_notebook = session.query(Notebook).filter(
+        Notebook.user_submission_id == submission.id
+    ).order_by(Notebook.submitted_at.desc()).first()
+    
+    if not latest_notebook:
+        raise HTTPException(status_code=404, detail="No notebook found for this submission")
+    
+    latest_notebook.score = data.score
     session.commit()
     
-    return {"status": "success", "activity": data.activity_id, "username": data.username, "score": data.score}
+    return {
+        "status": "success", 
+        "activity": data.activity_id, 
+        "user": data.user, 
+        "score": data.score,
+        "notebook_id": latest_notebook.id
+    }
 
 # Get activities by user email
 @app.get("/api/activities/by-email/{email}")
@@ -455,23 +474,40 @@ async def instructor_dashboard(
         <table>
             <tr>
                 <th>Name</th>
-                <th>Username</th>
+                <th>User</th>
                 <th>Email</th>
-                <th>Score</th>
-                <th>Notebook</th>
+                <th>Submissions</th>
+                <th>Latest Score</th>
+                <th>Latest Notebook</th>
             </tr>
         """
         
         for submission in activity.users:
-            score_display = f"{submission.score:.2f}" if submission.score is not None else "Not graded"
             email_display = submission.email or "—"
+            
+            # Get all notebooks for this submission, sorted by submitted_at
+            notebooks = session.query(Notebook).filter(
+                Notebook.user_submission_id == submission.id
+            ).order_by(Notebook.submitted_at.desc()).all()
+            
+            submission_count = len(notebooks)
+            
+            if notebooks:
+                latest = notebooks[0]
+                score_display = f"{latest.score:.2f}" if latest.score is not None else "Not graded"
+                download_link = f'<a href="/download/{activity.activity_id}/{submission.username}?notebook_id={latest.id}&token={token}">Download</a>'
+            else:
+                score_display = "No submissions"
+                download_link = "—"
+            
             html += f"""
             <tr>
                 <td>{submission.name}</td>
                 <td>{submission.username}</td>
                 <td>{email_display}</td>
+                <td>{submission_count}</td>
                 <td>{score_display}</td>
-                <td><a href="/download/{activity.activity_id}/{submission.username}?token={token}">Download</a></td>
+                <td>{download_link}</td>
             </tr>
             """
         
@@ -723,10 +759,11 @@ async def instructor_logout():
     return response
 
 # Download notebook endpoint
-@app.get("/download/{activity_id}/{username}")
+@app.get("/download/{activity_id}/{user}")
 async def download_notebook(
     activity_id: str,
-    username: str,
+    user: str,
+    notebook_id: Optional[int] = None,
     token: str = None,
     session: Session = Depends(get_db)
 ):
@@ -752,99 +789,36 @@ async def download_notebook(
     if not activity or instructor not in activity.instructors:
         raise HTTPException(status_code=403, detail="Access denied to this activity")
     
-    # Get submission
+    # Get user submission
     submission = session.query(UserSubmission).filter(
         UserSubmission.activity_id == activity_id,
-        UserSubmission.username == username
+        UserSubmission.username == user
     ).first()
     
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
     
+    # Get specific notebook or latest
+    if notebook_id:
+        notebook = session.query(Notebook).filter(
+            Notebook.id == notebook_id,
+            Notebook.user_submission_id == submission.id
+        ).first()
+    else:
+        # Get most recent notebook
+        notebook = session.query(Notebook).filter(
+            Notebook.user_submission_id == submission.id
+        ).order_by(Notebook.submitted_at.desc()).first()
+    
+    if not notebook:
+        raise HTTPException(status_code=404, detail="Notebook not found")
+    
     return StreamingResponse(
-        io.BytesIO(submission.notebook),
+        io.BytesIO(notebook.notebook),
         media_type="application/x-ipynb+json",
-        headers={"Content-Disposition": f"attachment; filename={submission.notebook_filename}"}
+        headers={"Content-Disposition": f"attachment; filename={notebook.notebook_filename}"}
     )
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8100)
-
-Base = declarative_base()
-
-# Association table for activity instructors
-activity_instructors = Table(
-    'activity_instructors',
-    Base.metadata,
-    Column('activity_id', String, ForeignKey('activities.activity_id')),
-    Column('instructor_id', Integer, ForeignKey('instructors.id'))
-)
-
-class Activity(Base):
-    __tablename__ = 'activities'
-    
-    activity_id = Column(String, primary_key=True)
-    activity_name = Column(String, nullable=False)  # Display name for activity
-    enabled = Column(Boolean, default=True)  # Enable/disable activity
-    grading_notebook = Column(LargeBinary)  # Store .ipynb file content
-    grading_notebook_filename = Column(String)
-    
-    # Relationships
-    users = relationship("UserSubmission", back_populates="activity", cascade="all, delete-orphan")
-    instructors = relationship("Instructor", secondary=activity_instructors, back_populates="activities")
-
-class UserSubmission(Base):
-    __tablename__ = 'user_submissions'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    activity_id = Column(String, ForeignKey('activities.activity_id'))
-    username = Column(String, nullable=False)
-    name = Column(String, nullable=False)
-    email = Column(String, nullable=True)  # User email for Google OAuth
-    prequiz_token = Column(String, nullable=True)  # Pre-quiz token
-    postquiz_token = Column(String, nullable=True)  # Post-quiz token
-    notebook = Column(LargeBinary)  # Store .ipynb file content
-    notebook_filename = Column(String)
-    score = Column(Float, nullable=True)
-    submitted_at = Column(String, default=lambda: datetime.utcnow().isoformat())
-    
-    # Relationships
-    activity = relationship("Activity", back_populates="users")
-    
-    # Ensure unique user per activity
-    __table_args__ = (
-        {'sqlite_autoincrement': True},
-    )
-
-class Instructor(Base):
-    __tablename__ = 'instructors'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    email = Column(String, unique=True, nullable=False)  # Google email for OAuth
-    name = Column(String, nullable=True)  # Display name from Google
-    
-    # Relationships
-    activities = relationship("Activity", secondary=activity_instructors, back_populates="instructors")
-
-# Database connection and session management
-class Database:
-    def __init__(self, db_url=None):
-        if db_url is None:
-            # Default to PostgreSQL
-            db_url = os.getenv(
-                'DATABASE_URL',
-                'postgresql://activity_user:activity_pass@localhost/activity_db'
-            )
-        
-        self.engine = create_engine(db_url)
-        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
-    
-    def create_tables(self):
-        Base.metadata.create_all(bind=self.engine)
-    
-    def get_session(self):
-        return self.SessionLocal()
-
-# Initialize database
-db = Database()
