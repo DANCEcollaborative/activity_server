@@ -132,34 +132,35 @@ def root():
 # Submission API
 @app.post("/api/submit")
 async def submit_assignment(
-    user: str = Form(...),
-    name: str = Form(...),
     activity: str = Form(...),
-    email: Optional[str] = Form(None),
+    email: str = Form(...),
+    user: Optional[str] = Form(None),
+    name: Optional[str] = Form(None),
     prequiz_token: Optional[str] = Form(None),
     postquiz_token: Optional[str] = Form(None),
     notebook: UploadFile = File(...),
     session: Session = Depends(get_db)
 ):
-    """Submit a notebook for grading"""
-    
+    """Submit a notebook for grading. Only 'activity' and 'email' are required."""
+
+    # Derive username and display name from email if not provided
+    derived_user = user or email.split("@")[0]
+    derived_name = name or derived_user
+
     # Verify activity exists
     activity_obj = session.query(Activity).filter(Activity.activity_id == activity).first()
     if not activity_obj:
         raise HTTPException(status_code=404, detail=f"Activity '{activity}' not found")
-    
-    # Read notebook content
-    notebook_content = await notebook.read()
-    
+
     # Check if user submission exists
     existing = session.query(UserSubmission).filter(
         UserSubmission.activity_id == activity,
-        UserSubmission.username == user
+        UserSubmission.username == derived_user
     ).first()
-    
+
     if existing:
         # Update existing user submission
-        existing.name = name
+        existing.name = derived_name
         existing.email = email
         existing.prequiz_token = prequiz_token
         existing.postquiz_token = postquiz_token
@@ -167,8 +168,8 @@ async def submit_assignment(
         # Create new user submission
         submission = UserSubmission(
             activity_id=activity,
-            username=user,
-            name=name,
+            username=derived_user,
+            name=derived_name,
             email=email,
             prequiz_token=prequiz_token,
             postquiz_token=postquiz_token
@@ -176,8 +177,16 @@ async def submit_assignment(
         session.add(submission)
         session.flush()  # Get the ID
         existing = submission
-    
-    # Create new notebook entry
+
+    response = {
+        "status": "success",
+        "message": "Submission received",
+        "user": derived_user,
+        "activity": activity,
+    }
+
+    # Always create a notebook entry
+    notebook_content = await notebook.read()
     new_notebook = Notebook(
         user_submission_id=existing.id,
         notebook=notebook_content,
@@ -186,16 +195,12 @@ async def submit_assignment(
         score=None
     )
     session.add(new_notebook)
-    
+    session.flush()
+    response["notebook_id"] = new_notebook.id
+
     session.commit()
-    
-    return {
-        "status": "success", 
-        "message": "Submission received", 
-        "user": user, 
-        "activity": activity,
-        "notebook_id": new_notebook.id
-    }
+
+    return response
 
 # Add activity
 @app.post("/api/activity")
