@@ -33,11 +33,7 @@ class UserSubmission(Base):
     id          = Column(Integer, primary_key=True, autoincrement=True)
     activity_id = Column(String, ForeignKey('activities.activity_id', ondelete='CASCADE'),
                          nullable=False)
-    username    = Column(String, nullable=False)
-    name        = Column(String, nullable=False)
-    email       = Column(String, nullable=True)
-    prequiz_token  = Column(String, nullable=True)
-    postquiz_token = Column(String, nullable=True)
+    email       = Column(String, nullable=False)
 
     activity  = relationship('Activity', back_populates='users')
     notebooks = relationship('Notebook', back_populates='user_submission',

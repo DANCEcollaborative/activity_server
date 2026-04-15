@@ -3,12 +3,11 @@ Activity Server – FastAPI application.
 
 Changes vs. previous version
 ─────────────────────────────
-• Activity no longer stores grading_notebook / grading_notebook_filename.
-  It now stores task_graders (path to grader directory on the host).
-• Notebook model now has a `feedback` field.
-• On every submission grader.py is invoked asynchronously; score + feedback
-  are written back to the Notebook row when grading completes.
-• Dashboard shows Latest Score and a Feedback download link per student row.
+• UserSubmission now requires only `email` + `activity_id`.
+  Fields username, name, prequiz_token, postquiz_token have been removed.
+• /api/submit accepts only: email, activity, notebook.
+• All lookup / download / score endpoints use email instead of username.
+• Dashboard displays email in place of username/name columns.
 """
 
 import asyncio
@@ -355,13 +354,9 @@ async def add_instructor(data: InstructorCreate, db: Session = Depends(get_db)):
 
 @app.post("/api/submit")
 async def submit_notebook(
-    user:           str        = Form(...),
-    name:           str        = Form(...),
-    activity:       str        = Form(...),
-    email:          str        = Form(None),
-    prequiz_token:  str        = Form(None),
-    postquiz_token: str        = Form(None),
-    notebook:       UploadFile = File(...),
+    email:    str        = Form(...),
+    activity: str        = Form(...),
+    notebook: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
     act = db.query(Activity).filter(Activity.activity_id == activity).first()
@@ -370,20 +365,16 @@ async def submit_notebook(
 
     notebook_content = await notebook.read()
 
-    # Upsert UserSubmission
+    # Upsert UserSubmission keyed on (email, activity_id)
     existing = db.query(UserSubmission).filter(
         UserSubmission.activity_id == activity,
-        UserSubmission.username    == user,
+        UserSubmission.email       == email,
     ).first()
 
     if not existing:
         existing = UserSubmission(
             activity_id=activity,
-            username=user,
-            name=name,
             email=email,
-            prequiz_token=prequiz_token,
-            postquiz_token=postquiz_token,
         )
         db.add(existing)
         db.flush()
@@ -418,7 +409,7 @@ async def submit_notebook(
 
 class ScoreUpdate(BaseModel):
     activity_id: str
-    user: str
+    email: str
     score: float
     feedback: str = None
 
@@ -427,7 +418,7 @@ class ScoreUpdate(BaseModel):
 async def update_score(data: ScoreUpdate, db: Session = Depends(get_db)):
     submission = db.query(UserSubmission).filter(
         UserSubmission.activity_id == data.activity_id,
-        UserSubmission.username    == data.user,
+        UserSubmission.email       == data.email,
     ).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
@@ -441,7 +432,7 @@ async def update_score(data: ScoreUpdate, db: Session = Depends(get_db)):
     if not latest:
         raise HTTPException(status_code=404, detail="No notebook found")
 
-    latest.score    = data.score
+    latest.score = data.score
     if data.feedback is not None:
         latest.feedback = data.feedback
     db.commit()
@@ -452,16 +443,16 @@ async def update_score(data: ScoreUpdate, db: Session = Depends(get_db)):
 # Download endpoints
 # ──────────────────────────────────────────────
 
-@app.get("/download/{activity_id}/{user}")
+@app.get("/download/{activity_id}/{email:path}")
 async def download_notebook(
     activity_id: str,
-    user: str,
+    email: str,
     notebook_id: int = None,
     db: Session = Depends(get_db),
 ):
     submission = db.query(UserSubmission).filter(
         UserSubmission.activity_id == activity_id,
-        UserSubmission.username    == user,
+        UserSubmission.email       == email,
     ).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
@@ -482,7 +473,8 @@ async def download_notebook(
     if not nb or not nb.notebook:
         raise HTTPException(status_code=404, detail="Notebook not found")
 
-    filename = nb.notebook_filename or f"{user}_{activity_id}.ipynb"
+    safe_email = email.replace("@", "_at_").replace(".", "_")
+    filename = nb.notebook_filename or f"{safe_email}_{activity_id}.ipynb"
     content  = _to_bytes(nb.notebook)
     return StreamingResponse(
         iter([content]),
@@ -491,16 +483,16 @@ async def download_notebook(
     )
 
 
-@app.get("/download-feedback/{activity_id}/{user}")
+@app.get("/download-feedback/{activity_id}/{email:path}")
 async def download_feedback(
     activity_id: str,
-    user: str,
+    email: str,
     notebook_id: int = None,
     db: Session = Depends(get_db),
 ):
     submission = db.query(UserSubmission).filter(
         UserSubmission.activity_id == activity_id,
-        UserSubmission.username    == user,
+        UserSubmission.email       == email,
     ).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
@@ -522,7 +514,8 @@ async def download_feedback(
         raise HTTPException(status_code=404, detail="Notebook not found")
 
     feedback_text = nb.feedback or "No feedback available."
-    filename = f"feedback_{user}_{activity_id}.txt"
+    safe_email = email.replace("@", "_at_").replace(".", "_")
+    filename = f"feedback_{safe_email}_{activity_id}.txt"
     return StreamingResponse(
         iter([feedback_text.encode()]),
         media_type="text/plain",
@@ -564,7 +557,6 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
     # ── Auth ──────────────────────────────────────────────────────────
     token = request.cookies.get("google_token")
     if not token:
-        # Show a minimal sign-in page
         return HTMLResponse(_signin_page())
 
     try:
@@ -598,7 +590,7 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
             if not notebooks:
                 continue
 
-            latest          = notebooks[0]
+            latest           = notebooks[0]
             submission_count = len(notebooks)
 
             if latest.score is None:
@@ -606,9 +598,9 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
             else:
                 score_cell = f'<span class="badge-score">{latest.score:.2f}</span>'
 
-            dl_url = (f"/download/{act.activity_id}/{sub.username}"
+            dl_url = (f"/download/{act.activity_id}/{sub.email}"
                       f"?notebook_id={latest.id}")
-            fb_url = (f"/download-feedback/{act.activity_id}/{sub.username}"
+            fb_url = (f"/download-feedback/{act.activity_id}/{sub.email}"
                       f"?notebook_id={latest.id}")
 
             feedback_btn = (
@@ -619,9 +611,7 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
 
             rows += f"""
             <tr>
-              <td>{sub.username}</td>
-              <td>{sub.name}</td>
-              <td>{sub.email or ''}</td>
+              <td>{sub.email}</td>
               <td>{submission_count}</td>
               <td>{latest.submitted_at or ''}</td>
               <td>{score_cell}</td>
@@ -638,12 +628,12 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
           <table>
             <thead>
               <tr>
-                <th>Username</th><th>Name</th><th>Email</th>
+                <th>Email</th>
                 <th>Submissions</th><th>Latest Submitted</th>
                 <th>Latest Score</th><th>Actions</th>
               </tr>
             </thead>
-            <tbody>{rows or '<tr><td colspan="7" style="color:#aaa">No submissions yet</td></tr>'}</tbody>
+            <tbody>{rows or '<tr><td colspan="5" style="color:#aaa">No submissions yet</td></tr>'}</tbody>
           </table>
         </div>"""
 
