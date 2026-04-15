@@ -1,4 +1,8 @@
 fastapi==0.104.1
+google-auth
+google-auth-oauthlib
+nbformat==5.7.0
+numpy==2.3.0
 uvicorn[standard]==0.24.0
 sqlalchemy==2.0.23
 psycopg2-binary==2.9.9

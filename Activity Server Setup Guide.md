@@ -121,6 +121,7 @@ docker compose ps
 # Test API
 curl http://localhost:8100/
 
+
 # Should return:
 # {"message":"Activity Server API","docs":"/docs"}
 
