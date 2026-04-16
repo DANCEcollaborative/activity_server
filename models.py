@@ -3,7 +3,9 @@ from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
 
+# ──────────────────────────────────────────────
 # Join table for Activity <-> Instructor many-to-many
+# ──────────────────────────────────────────────
 activity_instructors = Table(
     'activity_instructors',
     Base.metadata,
@@ -12,6 +14,9 @@ activity_instructors = Table(
 )
 
 
+# ──────────────────────────────────────────────
+# activities
+# ──────────────────────────────────────────────
 class Activity(Base):
     __tablename__ = 'activities'
 
@@ -20,42 +25,79 @@ class Activity(Base):
     enabled       = Column(Boolean, default=True)
     # Path to the directory containing per-task grader scripts (grade_task#.py)
     task_graders  = Column(String, nullable=True)
-
-    users       = relationship('UserSubmission', back_populates='activity',
-                               cascade='all, delete-orphan')
     instructors = relationship('Instructor', secondary=activity_instructors,
                                back_populates='activities')
 
+    # New relationship to UserActivity
+    user_activities = relationship('UserActivity', back_populates='activity',
+                                   cascade='all, delete-orphan')
 
-class UserSubmission(Base):
-    __tablename__ = 'user_submissions'
+
+# ──────────────────────────────────────────────
+# users
+# ──────────────────────────────────────────────
+
+class User(Base):
+    __tablename__ = 'users'
+
+    id       = Column(Integer, primary_key=True, autoincrement=True)
+    username = Column(String, nullable=True)
+    name     = Column(String, nullable=False)
+    email    = Column(String, unique=True, nullable=False)
+
+    # One user → many activity enrollments
+    activities = relationship('UserActivity', back_populates='user',
+                              cascade='all, delete-orphan')
+
+
+# ──────────────────────────────────────────────
+# user_activities
+# ──────────────────────────────────────────────
+
+class UserActivity(Base):
+    __tablename__ = 'user_activities'
 
     id          = Column(Integer, primary_key=True, autoincrement=True)
+    user_id     = Column(Integer, ForeignKey('users.id', ondelete='CASCADE'),
+                         nullable=False)
     activity_id = Column(String, ForeignKey('activities.activity_id', ondelete='CASCADE'),
                          nullable=False)
-    email       = Column(String, nullable=False)
+    password        = Column(String,  nullable=True)
+    prequiz_token   = Column(String,  nullable=True)
+    postquiz_token  = Column(String,  nullable=True)
 
-    activity  = relationship('Activity', back_populates='users')
-    notebooks = relationship('Notebook', back_populates='user_submission',
-                             cascade='all, delete-orphan',
-                             order_by='Notebook.submitted_at.desc()')
+    user     = relationship('User',     back_populates='activities')
+    activity = relationship('Activity', back_populates='user_activities')
+
+    # One enrollment → many submissions
+    submissions = relationship('Submission', back_populates='user_activity',
+                               cascade='all, delete-orphan',
+                               order_by='Submission.submitted_at.desc()')
 
 
-class Notebook(Base):
-    __tablename__ = 'notebooks'
+# ──────────────────────────────────────────────
+# submissions 
+# ──────────────────────────────────────────────
 
-    id                 = Column(Integer, primary_key=True, autoincrement=True)
-    user_submission_id = Column(Integer,
-                                ForeignKey('user_submissions.id', ondelete='CASCADE'),
-                                nullable=False)
-    notebook           = Column(LargeBinary, nullable=True)  # raw .ipynb bytes
-    notebook_filename  = Column(String, nullable=True)
-    submitted_at       = Column(String, nullable=True)   # ISO-format timestamp string
-    score              = Column(Float,  nullable=True)
-    feedback           = Column(String, nullable=True)   # Text feedback document
+class Submission(Base):
+    __tablename__ = 'submissions'
 
-    user_submission = relationship('UserSubmission', back_populates='notebooks')
+    id               = Column(Integer, primary_key=True, autoincrement=True)
+    user_activity_id = Column(Integer,
+                              ForeignKey('user_activities.id', ondelete='CASCADE'),
+                              nullable=False)
+    notebook          = Column(LargeBinary, nullable=True)   # raw .ipynb bytes
+    notebook_filename = Column(String, nullable=True)
+    submitted_at      = Column(String, nullable=True)        # ISO-format timestamp string
+    score             = Column(Float,  nullable=True)
+    feedback          = Column(String, nullable=True)        # Text feedback document
 
+    user_activity = relationship('UserActivity', back_populates='submissions')
+
+
+# ──────────────────────────────────────────────
+# instructors
+# ──────────────────────────────────────────────
 
 class Instructor(Base):
     __tablename__ = 'instructors'
