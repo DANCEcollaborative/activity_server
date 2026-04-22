@@ -263,7 +263,8 @@
     </div>
 <script>
         // ====== CONFIGURATION - UPDATE THESE VALUES ======
-        const API_BASE_URL = 'https://bazaar.lti.cs.cmu.edu'; // Your activity server URL
+        const API_BASE_URL = 'https://bazaar.lti.cs.cmu.edu'; // Your activity server URL 
+        // const API_BASE_URL = 'http://localhost:8100'; // Your activity server URL
         const GOOGLE_CLIENT_ID = '683742022812-5b3ohko5co4pi8dbh5rpdsm085fjhp14.apps.googleusercontent.com';
         const JUPYTER_SERVER = 'https://bazaar.lti.cs.cmu.edu';
         // ==================================================
@@ -402,12 +403,16 @@
             try {
                 const response = await fetch(`${API_BASE_URL}/api/activities/by-email/${encodeURIComponent(currentUser.email)}`);
                 
+                const responseText = await response.text();
+                let data;
+                try { data = JSON.parse(responseText); } catch(e) { data = null; }
+
                 if (!response.ok) {
-                    throw new Error('Failed to load courses from database');
+                    const detail = (data && data.detail) ? data.detail : (responseText || 'Unknown error');
+                    throw new Error('Server returned ' + response.status + ': ' + detail);
                 }
-                
-                const data = await response.json();
-                availableActivities = Array.isArray(data) ? data : (data.activities || []);
+
+                availableActivities = Array.isArray(data) ? data : ((data && data.activities) ? data.activities : []);
                 
                 courseSelect.disabled = false;
                 
@@ -429,7 +434,7 @@
                 console.error('Error loading courses:', error);
                 courseSelect.disabled = false;
                 courseSelect.innerHTML = '<option value="">-- Error loading courses --</option>';
-                showStatus('❌ Error loading courses from database. Please refresh and try again.', 'error');
+                showStatus('❌ ' + error.message, 'error');
             }
         }
 

@@ -330,6 +330,35 @@ async def list_activities(
     ]
 
 
+@app.get("/api/activities/by-email/{email:path}")
+async def activities_by_email(email: str, db: Session = Depends(get_db)):
+    """
+    Return [{activity_id, activity_name}] for all enabled activities that
+    the given user is enrolled in.  If the user does not exist in the users
+    table, returns an empty list (no error) so callers can check enrollment
+    before prompting for registration.
+
+    Example:
+        curl https://bazaar.lti.cs.cmu.edu/api/activities/by-email/chas.murray@gmail.com
+    """
+    user = db.query(User).filter(User.email == email).first()
+    if not user:
+        return []
+
+    result = []
+    for ua in user.activities:
+        act = db.query(Activity).filter(
+            Activity.activity_id == ua.activity_id,
+            Activity.enabled == True,
+        ).first()
+        if act:
+            result.append({
+                "activity_id": act.activity_id,
+                "activity_name": act.activity_name,
+            })
+    return result
+
+
 # ──────────────────────────────────────────────
 # Instructor endpoints
 # ──────────────────────────────────────────────
