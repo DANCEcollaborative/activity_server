@@ -65,6 +65,7 @@ class UserActivity(Base):
     password        = Column(String,  nullable=True)
     prequiz_token   = Column(String,  nullable=True)
     postquiz_token  = Column(String,  nullable=True)
+    room_name       = Column(String,  nullable=True)
 
     user     = relationship('User',     back_populates='activities')
     activity = relationship('Activity', back_populates='user_activities')

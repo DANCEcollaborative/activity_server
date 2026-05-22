@@ -10,6 +10,7 @@ Endpoints
 ─────────
 POST   /api/user                        – create / update a user
 POST   /api/user/activity               – enroll a user in an activity
+POST   /api/user/room                   – set / override room_name for an enrollment
 POST   /api/user/submit                 – submit a notebook (auto-graded)
 GET    /api/user/{email}/activities     – list enabled activities for a user
 
@@ -136,14 +137,59 @@ def _to_bytes(value) -> bytes:
 # ──────────────────────────────────────────────
 
 def _write_grading_result(submission_id: int, score: float, feedback: str):
-    """Persist score + feedback to a Submission row."""
+    """Persist score + feedback to the graded Submission row, then create a
+    mirrored Submission row for every other user that shares the same
+    room_name and activity_id, so their submission count and results stay
+    in sync with the submitting user."""
     db = SessionLocal()
     try:
         row = db.query(Submission).filter(Submission.id == submission_id).first()
-        if row:
-            row.score = score
-            row.feedback = feedback
+        if not row:
+            return
+        row.score = score
+        row.feedback = feedback
+        db.commit()
+
+        # ── Room-mate propagation ─────────────────────────────────────
+        # Find the UserActivity that owns this submission.
+        ua = db.query(UserActivity).filter(
+            UserActivity.id == row.user_activity_id
+        ).first()
+
+        if not ua or not ua.room_name:
+            # No room assigned – nothing to propagate.
+            return
+
+        # Find all other enrollments in the same activity + room.
+        roommates = (
+            db.query(UserActivity)
+            .filter(
+                UserActivity.activity_id == ua.activity_id,
+                UserActivity.room_name == ua.room_name,
+                UserActivity.id != ua.id,
+            )
+            .all()
+        )
+
+        for rm in roommates:
+            mirrored = Submission(
+                user_activity_id=rm.id,
+                notebook=row.notebook,
+                notebook_filename=row.notebook_filename,
+                submitted_at=row.submitted_at,
+                score=score,
+                feedback=feedback,
+            )
+            db.add(mirrored)
+            logger.info(
+                f"[grader] room mirror: new submission for user_activity_id={rm.id} "
+                f"score={score} submitted_at={row.submitted_at} "
+                f"via room '{ua.room_name}'"
+            )
+
+        if roommates:
             db.commit()
+
     finally:
         db.close()
 
@@ -477,6 +523,31 @@ async def add_user_activity(
     db.commit()
     db.refresh(ua)
     return {"status": "enrolled", "user_activity_id": ua.id}
+
+
+class UserRoomUpdate(BaseModel):
+    activity_id: str
+    email: str
+    room_name: str
+
+
+@app.post("/api/user/room")
+async def update_user_room(data: UserRoomUpdate, db: Session = Depends(get_db)):
+    """Set or override the room_name for a user's enrollment in an activity."""
+    user = db.query(User).filter(User.email == data.email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    ua = db.query(UserActivity).filter(
+        UserActivity.user_id == user.id,
+        UserActivity.activity_id == data.activity_id,
+    ).first()
+    if not ua:
+        raise HTTPException(status_code=404, detail="Enrollment not found")
+
+    ua.room_name = data.room_name
+    db.commit()
+    return {"status": "updated", "user_activity_id": ua.id, "room_name": ua.room_name}
 
 
 @app.post("/api/user/submit")
