@@ -536,13 +536,32 @@ async def upload_roster(
         activity = existing_activity
         is_new_activity = False
     else:
-        # Derive an activity_id if one was not supplied
+        # Derive an activity_id if one was not supplied.
+        # Follows RFC 1123 subdomain rules: lowercase alphanumeric + hyphens,
+        # must start and end with an alphanumeric character.
         if not activity_id:
-            slug = activity_name.lower().replace(" ", "_")
-            sec_slug = section.replace(" ", "_")
-            activity_id = f"{slug}-{sec_slug}-{year}-{semester.lower()}"
+            import re as _re
+            def _to_rfc1123_segment(s: str) -> str:
+                """Lower-case s, replace non-[a-z0-9] runs with '-', strip edge hyphens."""
+                return _re.sub(r'^-+|-+$', '', _re.sub(r'[^a-z0-9]+', '-', s.lower()))
+
+            parts = [_to_rfc1123_segment(p) for p in
+                     [activity_name, section, str(year), semester] if p]
+            parts = [p for p in parts if p]   # drop any empty segments
+            activity_id = '-'.join(parts)
 
         # Check the supplied activity_id isn't already in use by a different activity
+        import re as _re
+        _RFC1123_RE = r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+        if not _re.match(_RFC1123_RE, activity_id):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"activity_id '{activity_id}' does not meet RFC 1123 subdomain rules. "
+                    "Use only lowercase letters, digits, hyphens (-) and dots (.); "
+                    "it must start and end with a letter or digit."
+                ),
+            )
         id_conflict = db.query(Activity).filter(
             Activity.activity_id == activity_id
         ).first()
@@ -1406,11 +1425,23 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
                style="background:#f8f9fa;color:#555">
       </div>
 
-      <!-- Activity ID (optional) -->
+      <!-- Activity ID (optional, auto-generated, RFC 1123 subdomain) -->
       <div class="field">
-        <label for="f-activity-id">Activity ID <span style="color:#888;font-weight:400">(optional)</span></label>
-        <input type="text" id="f-activity-id" placeholder="Auto-generated if left blank">
-        <div class="hint">Must be unique. Leave blank to generate from activity name + section + year + semester.</div>
+        <label for="f-activity-id">Activity ID
+          <span style="color:#888;font-weight:400">(optional)</span>
+          <span id="id-valid-badge" style="display:none;margin-left:8px;font-size:.78rem;
+                font-weight:600;padding:1px 7px;border-radius:10px"></span>
+        </label>
+        <input type="text" id="f-activity-id"
+               placeholder="Auto-generated from fields above"
+               oninput="onActivityIdInput(this)">
+        <div class="hint">
+          Auto-generated from Activity Name + Section + Year + Semester.
+          You may edit it manually. Must follow RFC&nbsp;1123 subdomain format:
+          lowercase letters, digits, <code>-</code>, and <code>.</code> only;
+          must start and end with a letter or digit
+          (e.g.&nbsp;<code>intro-to-ai-11637-b-2024-fall</code>).
+        </div>
       </div>
 
       <!-- Roster file -->
@@ -1445,6 +1476,92 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
 const BEARER_TOKEN = `{safe_token}`;
 const INSTRUCTOR_EMAIL = `{safe_email}`;
 
+// RFC 1123 subdomain regex (as specified by Kubernetes / DNS naming rules)
+const RFC1123_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
+
+// ── RFC 1123 slug helpers ────────────────────────────────────────────
+
+/**
+ * Convert an arbitrary string to a valid RFC 1123 subdomain segment.
+ *   1. Lower-case everything.
+ *   2. Replace any run of characters that are not [a-z0-9] with a single '-'.
+ *   3. Strip leading/trailing hyphens.
+ */
+function toRFC1123Segment(str) {{
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')   // non-alphanumeric runs → single hyphen
+    .replace(/^-+|-+$/g, '');       // strip leading/trailing hyphens
+}}
+
+/**
+ * Build the auto-generated activity_id from the four source fields.
+ * Segments are joined with '-' and the whole string is validated.
+ * Returns '' if any required segment is empty or the result is invalid.
+ */
+function buildAutoId() {{
+  const name     = document.getElementById('f-activity-name').value.trim();
+  const year     = document.getElementById('f-year').value.trim();
+  const semester = document.getElementById('f-semester').value;
+
+  // Section comes from the roster file, which hasn't been parsed yet in the
+  // browser, so we omit it from the auto-generated preview (the server will
+  // incorporate it after parsing the CSV).
+  if (!name || !year || !semester) return '';
+
+  const parts = [name, year, semester].map(toRFC1123Segment).filter(Boolean);
+  if (parts.length < 3) return '';
+
+  const candidate = parts.join('-');
+  return RFC1123_RE.test(candidate) ? candidate : '';
+}}
+
+// ── Activity-ID live update & validation ─────────────────────────────
+
+/**
+ * Called whenever any of the three auto-generation source fields change.
+ * Only overwrites the Activity ID field when the user hasn't manually
+ * edited it (tracked by the data-manual attribute).
+ */
+function updateActivityId() {{
+  const idField = document.getElementById('f-activity-id');
+  if (idField.dataset.manual === 'true') return;   // user has taken over
+  const auto = buildAutoId();
+  idField.value = auto;
+  refreshIdBadge(auto);
+}}
+
+/**
+ * Called on every keystroke in the Activity ID field itself.
+ * Enforces lowercase in real-time and marks the field as manually edited.
+ */
+function onActivityIdInput(input) {{
+  // Enforce lowercase as the user types
+  const pos = input.selectionStart;
+  input.value = input.value.toLowerCase();
+  input.setSelectionRange(pos, pos);
+
+  input.dataset.manual = input.value !== '' ? 'true' : 'false';
+  refreshIdBadge(input.value);
+}}
+
+/**
+ * Show a ✓ / ✗ badge next to the Activity ID label indicating RFC 1123
+ * validity.  Hidden when the field is empty (will be auto-generated).
+ */
+function refreshIdBadge(value) {{
+  const badge = document.getElementById('id-valid-badge');
+  if (!value) {{
+    badge.style.display = 'none';
+    return;
+  }}
+  const ok = RFC1123_RE.test(value);
+  badge.style.display     = 'inline';
+  badge.textContent       = ok ? '✓ valid' : '✗ invalid format';
+  badge.style.background  = ok ? '#e6f4ea' : '#fce8e6';
+  badge.style.color       = ok ? '#137333' : '#c5221f';
+}}
+
 // ── Modal open / close ───────────────────────────────────────────────
 function openModal() {{
   document.getElementById('modal-overlay').classList.add('open');
@@ -1466,12 +1583,22 @@ document.addEventListener('keydown', function(e) {{
   if (e.key === 'Escape') closeModal();
 }});
 
+// Wire auto-generation to source fields
+['f-activity-name', 'f-year', 'f-semester'].forEach(function(id) {{
+  const el = document.getElementById(id);
+  const evt = (el.tagName === 'SELECT') ? 'change' : 'input';
+  el.addEventListener(evt, updateActivityId);
+}});
+
 // ── Helpers ──────────────────────────────────────────────────────────
 function resetModal() {{
   document.getElementById('f-activity-name').value = '';
   document.getElementById('f-year').value = '';
   document.getElementById('f-semester').value = '';
-  document.getElementById('f-activity-id').value = '';
+  const idField = document.getElementById('f-activity-id');
+  idField.value = '';
+  idField.dataset.manual = 'false';
+  document.getElementById('id-valid-badge').style.display = 'none';
   document.getElementById('f-roster').value = '';
   document.getElementById('file-name-display').textContent = 'No file chosen';
   hideError();
@@ -1531,6 +1658,17 @@ async function submitRoster() {{
   const yearInt = parseInt(year, 10);
   if (isNaN(yearInt) || yearInt < 2000 || yearInt > 2099) {{
     showError('Year must be a 4-digit number between 2000 and 2099.');
+    return;
+  }}
+
+  // Validate Activity ID if the user supplied one manually
+  if (activityId && !RFC1123_RE.test(activityId)) {{
+    showError(
+      'Activity ID has an invalid format.\\n' +
+      'It must contain only lowercase letters, digits, hyphens (-) and dots (.), ' +
+      'and must start and end with a letter or digit.\\n' +
+      'Example: intro-to-ai-11637-b-2024-fall'
+    );
     return;
   }}
 
