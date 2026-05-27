@@ -22,6 +22,8 @@ POST   /api/activity                    – create / update an activity
 DELETE /api/activity/{activity_id}      – delete an activity
 GET    /api/activities                  – list activities
 
+POST   /api/activity/roster             – upload a CSV roster to create/update an activity and enroll users
+
 POST   /api/instructor                  – add instructor / assign activity
 
 GET    /download/{activity_id}/{email}  – download latest (or specific) notebook
@@ -31,11 +33,14 @@ GET    /dashboard                       – instructor dashboard (Google auth)
 """
 
 import asyncio
+import csv
+import io
 import logging
 import os
 import subprocess
 import tempfile
 from datetime import datetime
+from typing import List, Optional
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -322,6 +327,9 @@ async def create_or_update_activity(
     activity_name: str = Form(...),
     enabled: bool = Form(True),
     task_graders: str = Form(None),
+    section: str = Form(None),
+    year: int = Form(None),
+    semester: str = Form(None),
     db: Session = Depends(get_db),
 ):
     activity = db.query(Activity).filter(
@@ -333,12 +341,21 @@ async def create_or_update_activity(
         activity.enabled = enabled
         if task_graders is not None:
             activity.task_graders = task_graders
+        if section is not None:
+            activity.section = section
+        if year is not None:
+            activity.year = year
+        if semester is not None:
+            activity.semester = semester
     else:
         activity = Activity(
             activity_id=activity_id,
             activity_name=activity_name,
             enabled=enabled,
             task_graders=task_graders,
+            section=section,
+            year=year,
+            semester=semester,
         )
         db.add(activity)
 
@@ -371,6 +388,9 @@ async def list_activities(
             "activity_name": a.activity_name,
             "enabled": a.enabled,
             "task_graders": a.task_graders,
+            "section": a.section,
+            "year": a.year,
+            "semester": a.semester,
         }
         for a in q.all()
     ]
@@ -403,6 +423,240 @@ async def activities_by_email(email: str, db: Session = Depends(get_db)):
                 "activity_name": act.activity_name,
             })
     return result
+
+
+# ──────────────────────────────────────────────
+# Roster upload endpoint
+# ──────────────────────────────────────────────
+
+# Valid role values for user_activities.role
+_VALID_ROLES = {"Student", "Instructor", "TA", "Admin"}
+
+
+@app.post("/api/activity/roster")
+async def upload_roster(
+    request: Request,
+    roster: UploadFile = File(...),
+    activity_name: str = Form(...),
+    year: int = Form(...),
+    semester: str = Form(...),
+    instructor_email: str = Form(...),
+    activity_id: str = Form(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Upload a CSV roster to create or update an activity and enroll users.
+
+    CSV columns expected: First Name, Last Name, SID, Email, Role, Section
+
+    Behaviour
+    ─────────
+    • If an activity with the same (activity_name, section, year, semester)
+      already exists, that activity is reused.  All existing "Student"
+      enrollments are removed and replaced with the roster rows whose Role is
+      "Student" (other roles are preserved and/or upserted).
+    • If no matching activity exists, a new one is created.  If activity_id is
+      supplied it is used as the primary key; otherwise one is auto-generated
+      as  "<slugified_activity_name>-<section>-<year>-<semester>".
+    • Users are created in the users table if they do not already exist.
+    • The instructor identified by instructor_email must already exist in the
+      instructors table; the activity is added to their assignment list.
+    """
+    # ── Auth ──────────────────────────────────────────────────────────
+    instructor = require_instructor(request, db)
+
+    # ── Parse CSV ─────────────────────────────────────────────────────
+    raw_bytes = await roster.read()
+    try:
+        text = raw_bytes.decode("utf-8-sig")   # strip BOM if present
+    except UnicodeDecodeError:
+        text = raw_bytes.decode("latin-1")
+
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Roster CSV is empty")
+
+    # Validate that the required columns are present
+    required_cols = {"Email", "Role", "Section"}
+    missing = required_cols - set(reader.fieldnames or [])
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV is missing required columns: {missing}",
+        )
+
+    # All rows must share a single section value (taken from the first row)
+    sections_in_csv = {r["Section"].strip() for r in rows if r.get("Section", "").strip()}
+    if len(sections_in_csv) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "All rows in the roster must have the same Section value.  "
+                f"Found: {sections_in_csv}"
+            ),
+        )
+    section = sections_in_csv.pop()
+
+    # Validate role values
+    for idx, row in enumerate(rows, start=2):   # row 1 is the header
+        role = row.get("Role", "").strip()
+        if role not in _VALID_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Row {idx}: invalid Role '{role}'.  "
+                    f"Must be one of {sorted(_VALID_ROLES)}."
+                ),
+            )
+
+    # ── Look up the instructor record from the token ──────────────────
+    # (require_instructor already verified the token; just confirm the
+    #  instructor_email param matches so callers can't enrol on behalf
+    #  of a different instructor without owning that token.)
+    if instructor.email.lower() != instructor_email.strip().lower():
+        raise HTTPException(
+            status_code=403,
+            detail="instructor_email does not match the authenticated instructor token",
+        )
+
+    # ── Find or create the Activity ───────────────────────────────────
+    existing_activity = (
+        db.query(Activity)
+        .filter(
+            Activity.activity_name == activity_name,
+            Activity.section       == section,
+            Activity.year          == year,
+            Activity.semester      == semester,
+        )
+        .first()
+    )
+
+    if existing_activity:
+        activity = existing_activity
+        is_new_activity = False
+    else:
+        # Derive an activity_id if one was not supplied
+        if not activity_id:
+            slug = activity_name.lower().replace(" ", "_")
+            sec_slug = section.replace(" ", "_")
+            activity_id = f"{slug}-{sec_slug}-{year}-{semester.lower()}"
+
+        # Check the supplied activity_id isn't already in use by a different activity
+        id_conflict = db.query(Activity).filter(
+            Activity.activity_id == activity_id
+        ).first()
+        if id_conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"activity_id '{activity_id}' is already used by a different "
+                    "activity.  Supply a unique activity_id or omit it to "
+                    "auto-generate one."
+                ),
+            )
+
+        activity = Activity(
+            activity_id=activity_id,
+            activity_name=activity_name,
+            enabled=True,
+            section=section,
+            year=year,
+            semester=semester,
+        )
+        db.add(activity)
+        db.flush()   # populate activity.activity_id before FK references
+        is_new_activity = True
+
+    # ── Assign instructor to the activity ─────────────────────────────
+    if activity not in instructor.activities:
+        instructor.activities.append(activity)
+
+    # ── If updating an existing activity, drop Student enrollments ────
+    if not is_new_activity:
+        student_uas = (
+            db.query(UserActivity)
+            .filter(
+                UserActivity.activity_id == activity.activity_id,
+                UserActivity.role        == "Student",
+            )
+            .all()
+        )
+        for ua in student_uas:
+            db.delete(ua)
+        db.flush()
+
+    # ── Upsert users and enroll them ──────────────────────────────────
+    enrolled: list[dict] = []
+    skipped:  list[dict] = []
+
+    for row in rows:
+        email = row.get("Email", "").strip()
+        if not email:
+            continue   # skip rows without an email address
+
+        first = row.get("First Name", "").strip()
+        last  = row.get("Last Name",  "").strip()
+        if first and last:
+            name = f"{first} {last}"
+        elif first:
+            name = first
+        elif last:
+            name = last
+        else:
+            name = email   # fallback so name is never empty
+
+        role = row.get("Role", "").strip()
+
+        # Upsert user
+        user = db.query(User).filter(User.email == email).first()
+        if user:
+            # Update name only if the new name is non-empty and different
+            if name and name != user.name:
+                user.name = name
+        else:
+            user = User(name=name, email=email)
+            db.add(user)
+            db.flush()
+
+        # Check for an existing enrollment (any role) before adding
+        existing_ua = (
+            db.query(UserActivity)
+            .filter(
+                UserActivity.user_id     == user.id,
+                UserActivity.activity_id == activity.activity_id,
+            )
+            .first()
+        )
+
+        if existing_ua:
+            # Update the role in case it changed
+            existing_ua.role = role
+            skipped.append({"email": email, "reason": "already enrolled; role updated"})
+        else:
+            ua = UserActivity(
+                user_id=user.id,
+                activity_id=activity.activity_id,
+                role=role,
+            )
+            db.add(ua)
+            enrolled.append({"email": email, "role": role})
+
+    db.commit()
+
+    return {
+        "status": "ok",
+        "activity_id": activity.activity_id,
+        "activity_name": activity.activity_name,
+        "section": activity.section,
+        "year": activity.year,
+        "semester": activity.semester,
+        "is_new_activity": is_new_activity,
+        "enrolled_count": len(enrolled),
+        "skipped_count": len(skipped),
+        "enrolled": enrolled,
+        "skipped": skipped,
+    }
 
 
 # ──────────────────────────────────────────────
