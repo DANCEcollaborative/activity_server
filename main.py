@@ -1071,15 +1071,34 @@ async def download_feedback(
 
 DASHBOARD_CSS = """
 <style>
+  /* ── Base ── */
+  *, *::before, *::after { box-sizing: border-box; }
   body { font-family: Arial, sans-serif; margin: 0; background: #f4f6f8; }
+
+  /* ── Header ── */
   header { background: #1a73e8; color: white; padding: 16px 24px;
            display: flex; align-items: center; gap: 16px; }
   header h1 { margin: 0; font-size: 1.3rem; }
+  .header-right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+
+  /* ── Add Activity button (header) ── */
+  .btn-add-activity {
+    background: white; color: #1a73e8; border: none; border-radius: 6px;
+    padding: 7px 16px; font-size: .9rem; font-weight: 600; cursor: pointer;
+    display: flex; align-items: center; gap: 6px;
+    transition: background .15s;
+  }
+  .btn-add-activity:hover { background: #e8f0fe; }
+
+  /* ── Main content ── */
   .container { max-width: 1100px; margin: 32px auto; padding: 0 16px; }
+
+  /* ── Activity cards ── */
   .activity-card { background: white; border-radius: 8px; margin-bottom: 32px;
                    box-shadow: 0 1px 4px rgba(0,0,0,.12); }
   .activity-card h2 { margin: 0; padding: 16px 20px;
                       border-bottom: 1px solid #e0e0e0; font-size: 1.1rem; }
+  .activity-meta { font-size: .8rem; color: #888; margin-left: 8px; }
   table { width: 100%; border-collapse: collapse; }
   th, td { padding: 10px 16px; text-align: left;
            border-bottom: 1px solid #f0f0f0; font-size: .9rem; }
@@ -1090,42 +1109,112 @@ DASHBOARD_CSS = """
   a.btn-fb   { background: #34a853; color: white; }
   .badge-grading { color: #f9a825; font-style: italic; }
   .badge-score   { font-weight: bold; }
+
+  /* ── Modal overlay ── */
+  .modal-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.45); z-index: 1000;
+    align-items: center; justify-content: center;
+  }
+  .modal-overlay.open { display: flex; }
+
+  /* ── Modal dialog ── */
+  .modal {
+    background: white; border-radius: 10px; width: 520px; max-width: 95vw;
+    box-shadow: 0 8px 32px rgba(0,0,0,.22);
+    display: flex; flex-direction: column;
+    max-height: 90vh; overflow: hidden;
+  }
+  .modal-header {
+    padding: 18px 24px 14px; border-bottom: 1px solid #e0e0e0;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .modal-header h2 { margin: 0; font-size: 1.1rem; color: #1a73e8; }
+  .modal-close {
+    background: none; border: none; font-size: 1.4rem; color: #888;
+    cursor: pointer; line-height: 1; padding: 0 4px;
+  }
+  .modal-close:hover { color: #333; }
+  .modal-body { padding: 20px 24px; overflow-y: auto; flex: 1; }
+  .modal-footer {
+    padding: 14px 24px; border-top: 1px solid #e0e0e0;
+    display: flex; gap: 10px; justify-content: flex-end;
+    background: #fafafa;
+  }
+
+  /* ── Form fields ── */
+  .field { margin-bottom: 16px; }
+  .field label {
+    display: block; font-size: .85rem; font-weight: 600;
+    color: #444; margin-bottom: 5px;
+  }
+  .field label .req { color: #d93025; margin-left: 2px; }
+  .field input[type="text"],
+  .field input[type="number"],
+  .field select {
+    width: 100%; padding: 8px 10px; border: 1px solid #ccc;
+    border-radius: 5px; font-size: .9rem; outline: none;
+    transition: border-color .15s;
+  }
+  .field input:focus, .field select:focus { border-color: #1a73e8; }
+  .field .hint { font-size: .78rem; color: #888; margin-top: 4px; }
+
+  /* ── File picker row ── */
+  .file-row { display: flex; align-items: center; gap: 10px; }
+  .file-row input[type="file"] { display: none; }
+  .btn-browse {
+    padding: 7px 14px; background: #f1f3f4; border: 1px solid #ccc;
+    border-radius: 5px; font-size: .85rem; cursor: pointer; white-space: nowrap;
+    transition: background .15s;
+  }
+  .btn-browse:hover { background: #e2e6ea; }
+  .file-name { font-size: .85rem; color: #555; overflow: hidden;
+               text-overflow: ellipsis; white-space: nowrap; }
+
+  /* ── Error banner ── */
+  .error-banner {
+    display: none; background: #fce8e6; border: 1px solid #f28b82;
+    color: #c5221f; border-radius: 5px; padding: 10px 14px;
+    font-size: .85rem; margin-bottom: 14px; white-space: pre-wrap;
+  }
+  .error-banner.visible { display: block; }
+
+  /* ── Success banner ── */
+  .success-banner {
+    display: none; background: #e6f4ea; border: 1px solid #81c995;
+    color: #137333; border-radius: 5px; padding: 10px 14px;
+    font-size: .85rem; margin-bottom: 14px;
+  }
+  .success-banner.visible { display: block; }
+
+  /* ── Dialog action buttons ── */
+  .btn-primary {
+    padding: 8px 20px; background: #1a73e8; color: white; border: none;
+    border-radius: 6px; font-size: .9rem; font-weight: 600; cursor: pointer;
+    transition: background .15s;
+  }
+  .btn-primary:hover:not(:disabled) { background: #1558b0; }
+  .btn-primary:disabled { background: #a8c7fa; cursor: default; }
+  .btn-secondary {
+    padding: 8px 20px; background: white; color: #444;
+    border: 1px solid #ccc; border-radius: 6px; font-size: .9rem;
+    cursor: pointer; transition: background .15s;
+  }
+  .btn-secondary:hover { background: #f1f3f4; }
+
+  /* ── Spinner ── */
+  .spinner {
+    display: none; width: 18px; height: 18px;
+    border: 3px solid #a8c7fa; border-top-color: #1a73e8;
+    border-radius: 50%; animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 """
 
 
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request, token: str = None, db: Session = Depends(get_db)):
-    # ── Auth ──────────────────────────────────────────────────────────
-    # Accept token from either:
-    #   1. ?token=<jwt> query param  (used after Google Sign-In callback)
-    #   2. google_token cookie       (set on first successful load, fallback)
-    if not token:
-        token = request.cookies.get("google_token")
-    if not token:
-        return HTMLResponse(_signin_page())
-
-    try:
-        claims = verify_google_token(token)
-    except Exception as exc:
-        logger.warning(f"[dashboard] token verification failed: {exc}")
-        return HTMLResponse(_signin_page(error=str(exc)))
-
-    email = claims.get("email", "")
-    instructor = db.query(Instructor).filter(
-        Instructor.email == email
-    ).first()
-    if not instructor:
-        return HTMLResponse(
-            "<!DOCTYPE html><html><head><meta charset=\'utf-8\'></head><body>"
-            f"<h2>Access denied.</h2>"
-            f"<p><b>{email}</b> is not registered as an instructor.</p>"
-            "<p><a href=\'/dashboard\'>Sign in with a different account</a></p>"
-            "</body></html>",
-            status_code=403,
-        )
-
-    # ── Build HTML ────────────────────────────────────────────────────
+def _build_activity_cards(instructor, db) -> str:
+    """Return the inner HTML for all activity cards belonging to an instructor."""
     cards = ""
     for act in instructor.activities:
         rows = ""
@@ -1177,10 +1266,18 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
               </td>
             </tr>"""
 
+        meta_parts = []
+        if act.section:  meta_parts.append(f"Section {act.section}")
+        if act.semester: meta_parts.append(act.semester)
+        if act.year:     meta_parts.append(str(act.year))
+        meta_str = " · ".join(meta_parts)
+        meta_html = f'<span class="activity-meta">{meta_str}</span>' if meta_str else ""
+
         cards += f"""
         <div class="activity-card">
-          <h2>{act.activity_name} <small style="color:#888;font-size:.8rem">
-              ({act.activity_id})</small></h2>
+          <h2>{act.activity_name}{meta_html}
+              <small style="color:#bbb;font-size:.75rem;margin-left:6px">({act.activity_id})</small>
+          </h2>
           <table>
             <thead>
               <tr>
@@ -1193,18 +1290,331 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
           </table>
         </div>"""
 
+    return cards or "<p style='color:#888'>No activities assigned yet.</p>"
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request, token: str = None, db: Session = Depends(get_db)):
+    # ── Auth ──────────────────────────────────────────────────────────
+    # Accept token from either:
+    #   1. ?token=<jwt> query param  (used after Google Sign-In callback)
+    #   2. google_token cookie       (set on first successful load, fallback)
+    if not token:
+        token = request.cookies.get("google_token")
+    if not token:
+        return HTMLResponse(_signin_page())
+
+    try:
+        claims = verify_google_token(token)
+    except Exception as exc:
+        logger.warning(f"[dashboard] token verification failed: {exc}")
+        return HTMLResponse(_signin_page(error=str(exc)))
+
+    email = claims.get("email", "")
+    instructor = db.query(Instructor).filter(
+        Instructor.email == email
+    ).first()
+    if not instructor:
+        return HTMLResponse(
+            "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
+            f"<h2>Access denied.</h2>"
+            f"<p><b>{email}</b> is not registered as an instructor.</p>"
+            "<p><a href='/dashboard'>Sign in with a different account</a></p>"
+            "</body></html>",
+            status_code=403,
+        )
+
+    cards_html = _build_activity_cards(instructor, db)
+
+    # Escape values that go into JS string literals
+    safe_token = token.replace("\\", "\\\\").replace("`", "\\`")
+    safe_email = email.replace("\\", "\\\\").replace("`", "\\`")
+
     html = f"""<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>Instructor Dashboard</title>{DASHBOARD_CSS}</head>
+<head>
+  <meta charset="utf-8">
+  <title>Instructor Dashboard</title>
+  {DASHBOARD_CSS}
+</head>
 <body>
-  <header>
-    <h1>📚 Instructor Dashboard</h1>
-    <span style="margin-left:auto">{instructor.name or email}</span>
-  </header>
-  <div class="container">{cards or '<p>No activities assigned.</p>'}</div>
+
+<!-- ═══════════════════════════════════════════
+     Header
+════════════════════════════════════════════ -->
+<header>
+  <h1>📚 Instructor Dashboard</h1>
+  <div class="header-right">
+    <button class="btn-add-activity" onclick="openModal()">
+      ＋ Add Activity
+    </button>
+    <span>{instructor.name or email}</span>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════════════════
+     Activity list (refreshed via JS after upload)
+════════════════════════════════════════════ -->
+<div class="container" id="activity-container">
+  {cards_html}
+</div>
+
+<!-- ═══════════════════════════════════════════
+     Add-Activity modal
+════════════════════════════════════════════ -->
+<div class="modal-overlay" id="modal-overlay" role="dialog"
+     aria-modal="true" aria-labelledby="modal-title">
+  <div class="modal">
+
+    <div class="modal-header">
+      <h2 id="modal-title">Add Activity</h2>
+      <button class="modal-close" onclick="closeModal()" aria-label="Close">&times;</button>
+    </div>
+
+    <div class="modal-body">
+      <!-- Error / success banners -->
+      <div class="error-banner"   id="error-banner"></div>
+      <div class="success-banner" id="success-banner"></div>
+
+      <!-- Activity Name -->
+      <div class="field">
+        <label for="f-activity-name">Activity Name <span class="req">*</span></label>
+        <input type="text" id="f-activity-name" placeholder="e.g. Introduction to AI">
+      </div>
+
+      <!-- Year + Semester (side by side) -->
+      <div style="display:flex;gap:14px">
+        <div class="field" style="flex:1">
+          <label for="f-year">Year <span class="req">*</span></label>
+          <input type="number" id="f-year" placeholder="e.g. 2024" min="2000" max="2099">
+        </div>
+        <div class="field" style="flex:1">
+          <label for="f-semester">Semester <span class="req">*</span></label>
+          <select id="f-semester">
+            <option value="">— select —</option>
+            <option>Fall</option>
+            <option>Spring</option>
+            <option>Summer</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Instructor email (pre-filled, read-only) -->
+      <div class="field">
+        <label for="f-instructor">Instructor Email <span class="req">*</span></label>
+        <input type="text" id="f-instructor" value="{safe_email}" readonly
+               style="background:#f8f9fa;color:#555">
+      </div>
+
+      <!-- Activity ID (optional) -->
+      <div class="field">
+        <label for="f-activity-id">Activity ID <span style="color:#888;font-weight:400">(optional)</span></label>
+        <input type="text" id="f-activity-id" placeholder="Auto-generated if left blank">
+        <div class="hint">Must be unique. Leave blank to generate from activity name + section + year + semester.</div>
+      </div>
+
+      <!-- Roster file -->
+      <div class="field">
+        <label>Roster CSV <span class="req">*</span></label>
+        <div class="file-row">
+          <button class="btn-browse" type="button" onclick="document.getElementById('f-roster').click()">
+            Add Roster
+          </button>
+          <input type="file" id="f-roster" accept=".csv,text/csv"
+                 onchange="onFileChosen(this)">
+          <span class="file-name" id="file-name-display">No file chosen</span>
+        </div>
+        <div class="hint">
+          Expected columns: First Name, Last Name, SID, Email, Role, Section.
+          All rows must share a single Section value.
+        </div>
+      </div>
+    </div><!-- /modal-body -->
+
+    <div class="modal-footer">
+      <div class="spinner" id="spinner"></div>
+      <button class="btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn-primary"   id="submit-btn" onclick="submitRoster()">Upload Roster</button>
+    </div>
+
+  </div><!-- /modal -->
+</div><!-- /modal-overlay -->
+
+<script>
+// ── Globals ──────────────────────────────────────────────────────────
+const BEARER_TOKEN = `{safe_token}`;
+const INSTRUCTOR_EMAIL = `{safe_email}`;
+
+// ── Modal open / close ───────────────────────────────────────────────
+function openModal() {{
+  document.getElementById('modal-overlay').classList.add('open');
+  resetModal();
+  document.getElementById('f-activity-name').focus();
+}}
+
+function closeModal() {{
+  document.getElementById('modal-overlay').classList.remove('open');
+}}
+
+// Close on backdrop click
+document.getElementById('modal-overlay').addEventListener('click', function(e) {{
+  if (e.target === this) closeModal();
+}});
+
+// Close on Escape
+document.addEventListener('keydown', function(e) {{
+  if (e.key === 'Escape') closeModal();
+}});
+
+// ── Helpers ──────────────────────────────────────────────────────────
+function resetModal() {{
+  document.getElementById('f-activity-name').value = '';
+  document.getElementById('f-year').value = '';
+  document.getElementById('f-semester').value = '';
+  document.getElementById('f-activity-id').value = '';
+  document.getElementById('f-roster').value = '';
+  document.getElementById('file-name-display').textContent = 'No file chosen';
+  hideError();
+  hideSuccess();
+  setLoading(false);
+}}
+
+function showError(msg) {{
+  const el = document.getElementById('error-banner');
+  el.textContent = msg;
+  el.classList.add('visible');
+  document.getElementById('success-banner').classList.remove('visible');
+}}
+
+function hideError() {{
+  document.getElementById('error-banner').classList.remove('visible');
+}}
+
+function showSuccess(msg) {{
+  const el = document.getElementById('success-banner');
+  el.textContent = msg;
+  el.classList.add('visible');
+  document.getElementById('error-banner').classList.remove('visible');
+}}
+
+function hideSuccess() {{
+  document.getElementById('success-banner').classList.remove('visible');
+}}
+
+function setLoading(on) {{
+  document.getElementById('spinner').style.display   = on ? 'block' : 'none';
+  document.getElementById('submit-btn').disabled     = on;
+}}
+
+function onFileChosen(input) {{
+  const display = document.getElementById('file-name-display');
+  display.textContent = input.files.length ? input.files[0].name : 'No file chosen';
+}}
+
+// ── Submit ────────────────────────────────────────────────────────────
+async function submitRoster() {{
+  hideError();
+  hideSuccess();
+
+  // Client-side validation
+  const activityName = document.getElementById('f-activity-name').value.trim();
+  const year         = document.getElementById('f-year').value.trim();
+  const semester     = document.getElementById('f-semester').value;
+  const activityId   = document.getElementById('f-activity-id').value.trim();
+  const rosterInput  = document.getElementById('f-roster');
+
+  if (!activityName) {{ showError('Activity Name is required.'); return; }}
+  if (!year)         {{ showError('Year is required.'); return; }}
+  if (!semester)     {{ showError('Semester is required.'); return; }}
+  if (!rosterInput.files.length) {{ showError('Please choose a roster CSV file.'); return; }}
+
+  const yearInt = parseInt(year, 10);
+  if (isNaN(yearInt) || yearInt < 2000 || yearInt > 2099) {{
+    showError('Year must be a 4-digit number between 2000 and 2099.');
+    return;
+  }}
+
+  setLoading(true);
+
+  const fd = new FormData();
+  fd.append('activity_name',    activityName);
+  fd.append('year',             String(yearInt));
+  fd.append('semester',         semester);
+  fd.append('instructor_email', INSTRUCTOR_EMAIL);
+  fd.append('roster',           rosterInput.files[0]);
+  if (activityId) fd.append('activity_id', activityId);
+
+  try {{
+    const resp = await fetch('/api/activity/roster', {{
+      method:  'POST',
+      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
+      body:    fd,
+    }});
+
+    const data = await resp.json().catch(() => ({{}}));
+
+    if (!resp.ok) {{
+      const detail = data.detail || `Server error ${{resp.status}}`;
+      showError(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      setLoading(false);
+      return;
+    }}
+
+    // ── Success: close modal, refresh activity list ────────────────
+    const label = data.is_new_activity ? 'created' : 'updated';
+    showSuccess(
+      `Activity "${{data.activity_name}}" ${{label}} · ` +
+      `${{data.enrolled_count}} enrolled, ${{data.skipped_count}} updated.`
+    );
+
+    // Slight delay so the user sees the success message, then reload cards
+    setTimeout(async () => {{
+      closeModal();
+      await refreshActivities();
+    }}, 1200);
+
+  }} catch (err) {{
+    showError('Network error: ' + err.message);
+    setLoading(false);
+  }}
+}}
+
+// ── Refresh activity cards without a full page reload ────────────────
+async function refreshActivities() {{
+  try {{
+    const resp = await fetch('/api/dashboard-cards', {{
+      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
+    }});
+    if (resp.ok) {{
+      const html = await resp.text();
+      document.getElementById('activity-container').innerHTML = html;
+    }} else {{
+      // Fallback: full page reload
+      window.location.reload();
+    }}
+  }} catch (_) {{
+    window.location.reload();
+  }}
+}}
+</script>
+
 </body>
 </html>"""
-    return HTMLResponse(html)
+    response = HTMLResponse(html)
+    # Persist token in a cookie so the user stays logged in across refreshes
+    response.set_cookie("google_token", token, httponly=True, samesite="lax")
+    return response
+
+
+@app.get("/api/dashboard-cards", response_class=HTMLResponse)
+async def dashboard_cards(request: Request, db: Session = Depends(get_db)):
+    """
+    Return just the inner HTML for the activity cards belonging to the
+    authenticated instructor.  Called by the dashboard JS after a successful
+    roster upload to refresh the list without a full page reload.
+    """
+    instructor = require_instructor(request, db)
+    return HTMLResponse(_build_activity_cards(instructor, db))
 
 
 def _signin_page(error: str = None) -> str:
