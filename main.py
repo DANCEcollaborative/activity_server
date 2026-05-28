@@ -364,15 +364,46 @@ async def create_or_update_activity(
 
 
 @app.delete("/api/activity/{activity_id}")
-async def delete_activity(activity_id: str, db: Session = Depends(get_db)):
+async def delete_activity(
+    activity_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Delete an activity and cascade-remove all associated user_activities and
+    submissions.  Requires a valid instructor Bearer token.
+    """
+    require_instructor(request, db)
+
     activity = db.query(Activity).filter(
         Activity.activity_id == activity_id
     ).first()
     if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Collect every UserActivity for this activity
+    user_activities = (
+        db.query(UserActivity)
+        .filter(UserActivity.activity_id == activity_id)
+        .all()
+    )
+
+    # Delete all Submissions for each enrollment
+    for ua in user_activities:
+        db.query(Submission).filter(
+            Submission.user_activity_id == ua.id
+        ).delete(synchronize_session=False)
+
+    # Delete all UserActivity rows
+    db.query(UserActivity).filter(
+        UserActivity.activity_id == activity_id
+    ).delete(synchronize_session=False)
+
+    # Delete the Activity itself (also removes activity_instructors join rows
+    # via the CASCADE defined on the FK)
     db.delete(activity)
     db.commit()
-    return {"status": "deleted"}
+    return {"status": "deleted", "activity_id": activity_id}
 
 
 @app.get("/api/activities")
@@ -545,6 +576,7 @@ async def upload_roster(
                 """Lower-case s, replace non-[a-z0-9] runs with '-', strip edge hyphens."""
                 return _re.sub(r'^-+|-+$', '', _re.sub(r'[^a-z0-9]+', '-', s.lower()))
 
+            # Order: name - section - year - semester
             parts = [_to_rfc1123_segment(p) for p in
                      [activity_name, section, str(year), semester] if p]
             parts = [p for p in parts if p]   # drop any empty segments
@@ -1228,6 +1260,69 @@ DASHBOARD_CSS = """
     border-radius: 50%; animation: spin .7s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Activity card header row ── */
+  .activity-card h2 {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  }
+  .activity-card h2 .h2-title { flex: 1; }
+
+  /* ── Delete Activity button (per-card) ── */
+  .btn-delete-activity {
+    background: #d93025; color: white; border: none; border-radius: 5px;
+    padding: 4px 11px; font-size: .78rem; font-weight: 600; cursor: pointer;
+    white-space: nowrap; transition: background .15s; flex-shrink: 0;
+  }
+  .btn-delete-activity:hover { background: #a50e0e; }
+
+  /* ── Delete-confirm dialog (reuses modal-overlay) ── */
+  .confirm-dialog {
+    background: #fff0f0; border: 2px solid #d93025;
+    border-radius: 10px; width: 480px; max-width: 95vw;
+    box-shadow: 0 8px 32px rgba(0,0,0,.25);
+    display: flex; flex-direction: column;
+  }
+  .confirm-header {
+    padding: 16px 20px 12px; border-bottom: 1px solid #f28b82;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .confirm-header h2 {
+    margin: 0; font-size: 1rem; color: #a50e0e; flex: 1;
+    display: block;   /* override the flex rule above for this h2 */
+  }
+  .confirm-body {
+    padding: 18px 20px; font-size: .9rem; color: #3c1010; line-height: 1.55;
+  }
+  .confirm-body code {
+    background: #fce8e6; padding: 1px 5px; border-radius: 3px;
+    font-size: .88rem; color: #a50e0e;
+  }
+  .confirm-footer {
+    padding: 12px 20px 16px; display: flex; gap: 10px;
+    justify-content: flex-end; background: #fff5f5;
+    border-top: 1px solid #f28b82; border-radius: 0 0 8px 8px;
+  }
+  /* "Do NOT Delete" — green, slightly larger */
+  .btn-no-delete {
+    padding: 9px 22px; background: #137333; color: white; border: none;
+    border-radius: 6px; font-size: .95rem; font-weight: 700; cursor: pointer;
+    transition: background .15s;
+  }
+  .btn-no-delete:hover { background: #0d5226; }
+  /* "DELETE" — red, slightly smaller */
+  .btn-confirm-delete {
+    padding: 7px 18px; background: #d93025; color: white; border: none;
+    border-radius: 6px; font-size: .85rem; font-weight: 600; cursor: pointer;
+    transition: background .15s;
+  }
+  .btn-confirm-delete:hover:not(:disabled) { background: #a50e0e; }
+  .btn-confirm-delete:disabled { background: #f28b82; cursor: default; }
+  /* delete spinner (red tones) */
+  .del-spinner {
+    display: none; width: 16px; height: 16px;
+    border: 3px solid #f28b82; border-top-color: #d93025;
+    border-radius: 50%; animation: spin .7s linear infinite;
+  }
 </style>
 """
 
@@ -1292,10 +1387,19 @@ def _build_activity_cards(instructor, db) -> str:
         meta_str = " · ".join(meta_parts)
         meta_html = f'<span class="activity-meta">{meta_str}</span>' if meta_str else ""
 
+        # Escape activity_id for safe use in JS string (single-quoted)
+        safe_act_id = act.activity_id.replace("'", "\\'")
+
         cards += f"""
         <div class="activity-card">
-          <h2>{act.activity_name}{meta_html}
+          <h2>
+            <span class="h2-title">{act.activity_name}{meta_html}
               <small style="color:#bbb;font-size:.75rem;margin-left:6px">({act.activity_id})</small>
+            </span>
+            <button class="btn-delete-activity"
+                    onclick="openDeleteConfirm('{safe_act_id}')">
+              🗑 Delete Activity
+            </button>
           </h2>
           <table>
             <thead>
@@ -1471,6 +1575,32 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
   </div><!-- /modal -->
 </div><!-- /modal-overlay -->
 
+<!-- ═══════════════════════════════════════════
+     Delete-confirm dialog  (reuses modal-overlay pattern)
+════════════════════════════════════════════ -->
+<div class="modal-overlay" id="delete-overlay" role="dialog"
+     aria-modal="true" aria-labelledby="del-title">
+  <div class="confirm-dialog">
+
+    <div class="confirm-header">
+      <h2 id="del-title">⚠️ Confirm Deletion</h2>
+    </div>
+
+    <div class="confirm-body" id="del-body">
+      <!-- filled by JS -->
+    </div>
+
+    <div class="confirm-footer">
+      <div class="del-spinner" id="del-spinner"></div>
+      <button class="btn-no-delete"      id="btn-no-delete"
+              onclick="closeDeleteConfirm()">Do NOT Delete</button>
+      <button class="btn-confirm-delete" id="btn-confirm-delete"
+              onclick="confirmDelete()">DELETE</button>
+    </div>
+
+  </div>
+</div>
+
 <script>
 // ── Globals ──────────────────────────────────────────────────────────
 const BEARER_TOKEN = `{safe_token}`;
@@ -1496,6 +1626,7 @@ function toRFC1123Segment(str) {{
 
 /**
  * Build the auto-generated activity_id from the four source fields.
+ * Order: name - section - year - semester  (section from the roster CSV).
  * Segments are joined with '-' and the whole string is validated.
  * Returns '' if any required segment is empty or the result is invalid.
  */
@@ -1503,14 +1634,18 @@ function buildAutoId() {{
   const name     = document.getElementById('f-activity-name').value.trim();
   const year     = document.getElementById('f-year').value.trim();
   const semester = document.getElementById('f-semester').value;
+  // Section is read from the roster CSV by onFileChosen and stored here
+  const section  = window._rosterSection || '';
 
-  // Section comes from the roster file, which hasn't been parsed yet in the
-  // browser, so we omit it from the auto-generated preview (the server will
-  // incorporate it after parsing the CSV).
   if (!name || !year || !semester) return '';
 
-  const parts = [name, year, semester].map(toRFC1123Segment).filter(Boolean);
-  if (parts.length < 3) return '';
+  // Include section between name and year when available
+  const rawParts = section
+    ? [name, section, year, semester]
+    : [name, year, semester];
+
+  const parts = rawParts.map(toRFC1123Segment).filter(Boolean);
+  if (parts.length < (section ? 4 : 3)) return '';
 
   const candidate = parts.join('-');
   return RFC1123_RE.test(candidate) ? candidate : '';
@@ -1519,7 +1654,8 @@ function buildAutoId() {{
 // ── Activity-ID live update & validation ─────────────────────────────
 
 /**
- * Called whenever any of the three auto-generation source fields change.
+ * Called whenever any of the auto-generation source fields change
+ * (Activity Name, Year, Semester, or the roster file).
  * Only overwrites the Activity ID field when the user hasn't manually
  * edited it (tracked by the data-manual attribute).
  */
@@ -1601,6 +1737,7 @@ function resetModal() {{
   document.getElementById('id-valid-badge').style.display = 'none';
   document.getElementById('f-roster').value = '';
   document.getElementById('file-name-display').textContent = 'No file chosen';
+  window._rosterSection = '';
   hideError();
   hideSuccess();
   setLoading(false);
@@ -1636,6 +1773,37 @@ function setLoading(on) {{
 function onFileChosen(input) {{
   const display = document.getElementById('file-name-display');
   display.textContent = input.files.length ? input.files[0].name : 'No file chosen';
+
+  // Reset stored section; re-parse from the new file
+  window._rosterSection = '';
+
+  if (!input.files.length) {{
+    updateActivityId();
+    return;
+  }}
+
+  // Read the CSV in the browser to extract the Section value for the auto-ID
+  const reader = new FileReader();
+  reader.onload = function(e) {{
+    try {{
+      const text  = e.target.result;
+      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      if (lines.length < 2) {{ updateActivityId(); return; }}
+
+      // Parse header row to find the Section column index
+      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const secIdx  = headers.findIndex(h => h.toLowerCase() === 'section');
+      if (secIdx === -1) {{ updateActivityId(); return; }}
+
+      // Read section from first data row
+      const firstRow = lines[1].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+      window._rosterSection = firstRow[secIdx] || '';
+    }} catch (_) {{
+      window._rosterSection = '';
+    }}
+    updateActivityId();
+  }};
+  reader.readAsText(input.files[0]);
 }}
 
 // ── Submit ────────────────────────────────────────────────────────────
@@ -1732,6 +1900,78 @@ async function refreshActivities() {{
     }}
   }} catch (_) {{
     window.location.reload();
+  }}
+}}
+
+// ── Delete-confirm dialog ─────────────────────────────────────────────
+
+let _pendingDeleteId = null;   // activity_id awaiting user confirmation
+
+function openDeleteConfirm(activityId) {{
+  _pendingDeleteId = activityId;
+
+  // Build confirmation message
+  document.getElementById('del-body').innerHTML =
+    `Are you sure you want to delete activity <code>${{activityId}}</code>?` +
+    `<br><br>All activity records, including submissions, will be deleted as well.`;
+
+  // Reset button states
+  document.getElementById('btn-confirm-delete').disabled = false;
+  document.getElementById('btn-no-delete').disabled      = false;
+  document.getElementById('del-spinner').style.display   = 'none';
+
+  // Open overlay and focus the safe "Do NOT Delete" button
+  document.getElementById('delete-overlay').classList.add('open');
+  setTimeout(() => document.getElementById('btn-no-delete').focus(), 50);
+}}
+
+function closeDeleteConfirm() {{
+  document.getElementById('delete-overlay').classList.remove('open');
+  _pendingDeleteId = null;
+}}
+
+// Close on backdrop click
+document.getElementById('delete-overlay').addEventListener('click', function(e) {{
+  if (e.target === this) closeDeleteConfirm();
+}});
+
+async function confirmDelete() {{
+  if (!_pendingDeleteId) return;
+  const activityId = _pendingDeleteId;
+
+  // Lock UI during the request
+  document.getElementById('btn-confirm-delete').disabled = true;
+  document.getElementById('btn-no-delete').disabled      = true;
+  document.getElementById('del-spinner').style.display   = 'block';
+
+  try {{
+    const resp = await fetch(`/api/activity/${{encodeURIComponent(activityId)}}`, {{
+      method:  'DELETE',
+      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
+    }});
+
+    if (!resp.ok) {{
+      const data = await resp.json().catch(() => ({{}}));
+      const msg  = data.detail || `Server error ${{resp.status}}`;
+      // Show error inside confirm dialog body before re-enabling buttons
+      document.getElementById('del-body').innerHTML +=
+        `<br><br><span style="color:#a50e0e;font-weight:600">Error: ${{msg}}</span>`;
+      document.getElementById('btn-confirm-delete').disabled = false;
+      document.getElementById('btn-no-delete').disabled      = false;
+      document.getElementById('del-spinner').style.display   = 'none';
+      return;
+    }}
+
+    // Success — close dialog and refresh card list
+    closeDeleteConfirm();
+    await refreshActivities();
+
+  }} catch (err) {{
+    document.getElementById('del-body').innerHTML +=
+      `<br><br><span style="color:#a50e0e;font-weight:600">Network error: ${{err.message}}</span>`;
+    document.getElementById('btn-confirm-delete').disabled = false;
+    document.getElementById('btn-no-delete').disabled      = false;
+    document.getElementById('del-spinner').style.display   = 'none';
   }}
 }}
 </script>
