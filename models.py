@@ -25,6 +25,12 @@ class Activity(Base):
     enabled       = Column(Boolean, default=True)
     # Path to the directory containing per-task grader scripts (grade_task#.py)
     task_graders  = Column(String, nullable=True)
+    # Section identifier (alphanumeric with special characters such as hyphens, e.g. "11637-B")
+    section       = Column(String, nullable=True)
+    # 4-digit academic year (e.g. 2024)
+    year          = Column(Integer, nullable=True)
+    # Semester string (e.g. "Fall", "Spring", "Summer")
+    semester      = Column(String, nullable=True)
     instructors = relationship('Instructor', secondary=activity_instructors,
                                back_populates='activities')
 
@@ -66,6 +72,8 @@ class UserActivity(Base):
     prequiz_token   = Column(String,  nullable=True)
     postquiz_token  = Column(String,  nullable=True)
     room_name       = Column(String,  nullable=True)
+    # Role of the user in this activity: "Student", "Instructor", "TA", or "Admin"
+    role            = Column(String,  nullable=True)
 
     user     = relationship('User',     back_populates='activities')
     activity = relationship('Activity', back_populates='user_activities')
