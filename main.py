@@ -23,6 +23,7 @@ DELETE /api/activity/{activity_id}      – delete an activity
 GET    /api/activities                  – list activities
 
 POST   /api/activity/roster             – upload a CSV roster to create/update an activity and enroll users
+POST   /api/activity/roster/update      – update enrollment for an existing activity from a new CSV roster
 
 POST   /api/instructor                  – add instructor / assign activity
 
@@ -1267,6 +1268,14 @@ DASHBOARD_CSS = """
   }
   .activity-card h2 .h2-title { flex: 1; }
 
+  /* ── Update Roster button (per-card) ── */
+  .btn-update-roster {
+    background: #137333; color: white; border: none; border-radius: 5px;
+    padding: 4px 11px; font-size: .78rem; font-weight: 600; cursor: pointer;
+    white-space: nowrap; transition: background .15s; flex-shrink: 0;
+  }
+  .btn-update-roster:hover { background: #0d5226; }
+
   /* ── Delete Activity button (per-card) ── */
   .btn-delete-activity {
     background: #d93025; color: white; border: none; border-radius: 5px;
@@ -1396,6 +1405,13 @@ def _build_activity_cards(instructor, db) -> str:
             <span class="h2-title">{act.activity_name}{meta_html}
               <small style="color:#bbb;font-size:.75rem;margin-left:6px">({act.activity_id})</small>
             </span>
+            <button class="btn-update-roster"
+                    onclick="document.getElementById('ur-input-{act.activity_id}').click()">
+              ↺ Update Roster
+            </button>
+            <input type="file" id="ur-input-{act.activity_id}"
+                   accept=".csv,text/csv" style="display:none"
+                   onchange="onUpdateRosterChosen(this, '{safe_act_id}')">
             <button class="btn-delete-activity"
                     onclick="openDeleteConfirm('{safe_act_id}')">
               🗑 Delete Activity
@@ -1603,43 +1619,34 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
 
 <script>
 // ── Globals ──────────────────────────────────────────────────────────
-const BEARER_TOKEN = `{safe_token}`;
-const INSTRUCTOR_EMAIL = `{safe_email}`;
+const BEARER_TOKEN     = `{{safe_token}}`;
+const INSTRUCTOR_EMAIL = `{{safe_email}}`;
 
-// RFC 1123 subdomain regex (as specified by Kubernetes / DNS naming rules)
-const RFC1123_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
+// RFC 1123 subdomain validation.
+// Written as new RegExp(...) to avoid Python f-string backslash conflicts
+// with JS regex literal syntax.
+const RFC1123_RE = new RegExp(
+  '^[a-z0-9]([-a-z0-9]*[a-z0-9])?' +
+  '(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+);
 
 // ── RFC 1123 slug helpers ────────────────────────────────────────────
 
-/**
- * Convert an arbitrary string to a valid RFC 1123 subdomain segment.
- *   1. Lower-case everything.
- *   2. Replace any run of characters that are not [a-z0-9] with a single '-'.
- *   3. Strip leading/trailing hyphens.
- */
 function toRFC1123Segment(str) {{
   return str
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')   // non-alphanumeric runs → single hyphen
-    .replace(/^-+|-+$/g, '');       // strip leading/trailing hyphens
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
 }}
 
-/**
- * Build the auto-generated activity_id from the four source fields.
- * Order: name - section - year - semester  (section from the roster CSV).
- * Segments are joined with '-' and the whole string is validated.
- * Returns '' if any required segment is empty or the result is invalid.
- */
 function buildAutoId() {{
   const name     = document.getElementById('f-activity-name').value.trim();
   const year     = document.getElementById('f-year').value.trim();
   const semester = document.getElementById('f-semester').value;
-  // Section is read from the roster CSV by onFileChosen and stored here
   const section  = window._rosterSection || '';
 
   if (!name || !year || !semester) return '';
 
-  // Include section between name and year when available
   const rawParts = section
     ? [name, section, year, semester]
     : [name, year, semester];
@@ -1653,52 +1660,34 @@ function buildAutoId() {{
 
 // ── Activity-ID live update & validation ─────────────────────────────
 
-/**
- * Called whenever any of the auto-generation source fields change
- * (Activity Name, Year, Semester, or the roster file).
- * Only overwrites the Activity ID field when the user hasn't manually
- * edited it (tracked by the data-manual attribute).
- */
 function updateActivityId() {{
   const idField = document.getElementById('f-activity-id');
-  if (idField.dataset.manual === 'true') return;   // user has taken over
+  if (idField.dataset.manual === 'true') return;
   const auto = buildAutoId();
   idField.value = auto;
   refreshIdBadge(auto);
 }}
 
-/**
- * Called on every keystroke in the Activity ID field itself.
- * Enforces lowercase in real-time and marks the field as manually edited.
- */
 function onActivityIdInput(input) {{
-  // Enforce lowercase as the user types
   const pos = input.selectionStart;
   input.value = input.value.toLowerCase();
   input.setSelectionRange(pos, pos);
-
   input.dataset.manual = input.value !== '' ? 'true' : 'false';
   refreshIdBadge(input.value);
 }}
 
-/**
- * Show a ✓ / ✗ badge next to the Activity ID label indicating RFC 1123
- * validity.  Hidden when the field is empty (will be auto-generated).
- */
 function refreshIdBadge(value) {{
   const badge = document.getElementById('id-valid-badge');
-  if (!value) {{
-    badge.style.display = 'none';
-    return;
-  }}
+  if (!value) {{ badge.style.display = 'none'; return; }}
   const ok = RFC1123_RE.test(value);
-  badge.style.display     = 'inline';
-  badge.textContent       = ok ? '✓ valid' : '✗ invalid format';
-  badge.style.background  = ok ? '#e6f4ea' : '#fce8e6';
-  badge.style.color       = ok ? '#137333' : '#c5221f';
+  badge.style.display    = 'inline';
+  badge.textContent      = ok ? '✓ valid' : '✗ invalid format';
+  badge.style.background = ok ? '#e6f4ea' : '#fce8e6';
+  badge.style.color      = ok ? '#137333' : '#c5221f';
 }}
 
-// ── Modal open / close ───────────────────────────────────────────────
+// ── Add-Activity modal open / close ──────────────────────────────────
+
 function openModal() {{
   document.getElementById('modal-overlay').classList.add('open');
   resetModal();
@@ -1709,33 +1698,34 @@ function closeModal() {{
   document.getElementById('modal-overlay').classList.remove('open');
 }}
 
-// Close on backdrop click
 document.getElementById('modal-overlay').addEventListener('click', function(e) {{
   if (e.target === this) closeModal();
 }});
 
-// Close on Escape
 document.addEventListener('keydown', function(e) {{
-  if (e.key === 'Escape') closeModal();
+  if (e.key === 'Escape') {{
+    closeModal();
+    closeDeleteConfirm();
+  }}
 }});
 
-// Wire auto-generation to source fields
 ['f-activity-name', 'f-year', 'f-semester'].forEach(function(id) {{
-  const el = document.getElementById(id);
+  const el  = document.getElementById(id);
   const evt = (el.tagName === 'SELECT') ? 'change' : 'input';
   el.addEventListener(evt, updateActivityId);
 }});
 
-// ── Helpers ──────────────────────────────────────────────────────────
+// ── Add-Activity modal helpers ────────────────────────────────────────
+
 function resetModal() {{
   document.getElementById('f-activity-name').value = '';
-  document.getElementById('f-year').value = '';
-  document.getElementById('f-semester').value = '';
+  document.getElementById('f-year').value           = '';
+  document.getElementById('f-semester').value       = '';
   const idField = document.getElementById('f-activity-id');
-  idField.value = '';
+  idField.value          = '';
   idField.dataset.manual = 'false';
-  document.getElementById('id-valid-badge').style.display = 'none';
-  document.getElementById('f-roster').value = '';
+  document.getElementById('id-valid-badge').style.display  = 'none';
+  document.getElementById('f-roster').value                = '';
   document.getElementById('file-name-display').textContent = 'No file chosen';
   window._rosterSection = '';
   hideError();
@@ -1766,36 +1756,26 @@ function hideSuccess() {{
 }}
 
 function setLoading(on) {{
-  document.getElementById('spinner').style.display   = on ? 'block' : 'none';
-  document.getElementById('submit-btn').disabled     = on;
+  document.getElementById('spinner').style.display  = on ? 'block' : 'none';
+  document.getElementById('submit-btn').disabled    = on;
 }}
 
 function onFileChosen(input) {{
-  const display = document.getElementById('file-name-display');
-  display.textContent = input.files.length ? input.files[0].name : 'No file chosen';
+  document.getElementById('file-name-display').textContent =
+    input.files.length ? input.files[0].name : 'No file chosen';
 
-  // Reset stored section; re-parse from the new file
   window._rosterSection = '';
+  if (!input.files.length) {{ updateActivityId(); return; }}
 
-  if (!input.files.length) {{
-    updateActivityId();
-    return;
-  }}
-
-  // Read the CSV in the browser to extract the Section value for the auto-ID
   const reader = new FileReader();
   reader.onload = function(e) {{
     try {{
-      const text  = e.target.result;
-      const lines = text.split(/\r?\n/).filter(l => l.trim());
+      const text    = e.target.result;
+      const lines   = text.split(/\r?\n/).filter(l => l.trim());
       if (lines.length < 2) {{ updateActivityId(); return; }}
-
-      // Parse header row to find the Section column index
       const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
       const secIdx  = headers.findIndex(h => h.toLowerCase() === 'section');
       if (secIdx === -1) {{ updateActivityId(); return; }}
-
-      // Read section from first data row
       const firstRow = lines[1].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
       window._rosterSection = firstRow[secIdx] || '';
     }} catch (_) {{
@@ -1806,21 +1786,21 @@ function onFileChosen(input) {{
   reader.readAsText(input.files[0]);
 }}
 
-// ── Submit ────────────────────────────────────────────────────────────
+// ── Add-Activity submit ───────────────────────────────────────────────
+
 async function submitRoster() {{
   hideError();
   hideSuccess();
 
-  // Client-side validation
   const activityName = document.getElementById('f-activity-name').value.trim();
   const year         = document.getElementById('f-year').value.trim();
   const semester     = document.getElementById('f-semester').value;
   const activityId   = document.getElementById('f-activity-id').value.trim();
   const rosterInput  = document.getElementById('f-roster');
 
-  if (!activityName) {{ showError('Activity Name is required.'); return; }}
-  if (!year)         {{ showError('Year is required.'); return; }}
-  if (!semester)     {{ showError('Semester is required.'); return; }}
+  if (!activityName)             {{ showError('Activity Name is required.'); return; }}
+  if (!year)                     {{ showError('Year is required.'); return; }}
+  if (!semester)                 {{ showError('Semester is required.'); return; }}
   if (!rosterInput.files.length) {{ showError('Please choose a roster CSV file.'); return; }}
 
   const yearInt = parseInt(year, 10);
@@ -1829,12 +1809,11 @@ async function submitRoster() {{
     return;
   }}
 
-  // Validate Activity ID if the user supplied one manually
   if (activityId && !RFC1123_RE.test(activityId)) {{
     showError(
-      'Activity ID has an invalid format.\\n' +
-      'It must contain only lowercase letters, digits, hyphens (-) and dots (.), ' +
-      'and must start and end with a letter or digit.\\n' +
+      'Activity ID has an invalid format.\n' +
+      'Use only lowercase letters, digits, hyphens (-) and dots (.).\n' +
+      'Must start and end with a letter or digit.\n' +
       'Example: intro-to-ai-11637-b-2024-fall'
     );
     return;
@@ -1860,20 +1839,17 @@ async function submitRoster() {{
     const data = await resp.json().catch(() => ({{}}));
 
     if (!resp.ok) {{
-      const detail = data.detail || `Server error ${{resp.status}}`;
-      showError(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      showError(typeof data.detail === 'string'
+        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
       setLoading(false);
       return;
     }}
 
-    // ── Success: close modal, refresh activity list ────────────────
     const label = data.is_new_activity ? 'created' : 'updated';
     showSuccess(
-      `Activity "${{data.activity_name}}" ${{label}} · ` +
-      `${{data.enrolled_count}} enrolled, ${{data.skipped_count}} updated.`
+      'Activity "' + data.activity_name + '" ' + label + ' · ' +
+      data.enrolled_count + ' enrolled, ' + data.skipped_count + ' updated.'
     );
-
-    // Slight delay so the user sees the success message, then reload cards
     setTimeout(async () => {{
       closeModal();
       await refreshActivities();
@@ -1885,17 +1861,60 @@ async function submitRoster() {{
   }}
 }}
 
-// ── Refresh activity cards without a full page reload ────────────────
+// ── Update Roster (per-card file input) ──────────────────────────────
+
+async function onUpdateRosterChosen(input, activityId) {{
+  if (!input.files.length) return;
+  const file = input.files[0];
+
+  const btn = input.previousElementSibling;
+  const origLabel = btn.textContent;
+  btn.textContent = '⏳ Uploading…';
+  btn.disabled    = true;
+
+  const fd = new FormData();
+  fd.append('activity_id', activityId);
+  fd.append('roster',      file);
+
+  try {{
+    const resp = await fetch('/api/activity/roster/update', {{
+      method:  'POST',
+      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
+      body:    fd,
+    }});
+
+    const data = await resp.json().catch(() => ({{}}));
+
+    if (!resp.ok) {{
+      const msg = typeof data.detail === 'string'
+        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status);
+      alert('Update Roster failed:\n\n' + msg);
+      btn.textContent = origLabel;
+      btn.disabled    = false;
+      input.value     = '';
+      return;
+    }}
+
+    await refreshActivities();
+
+  }} catch (err) {{
+    alert('Network error: ' + err.message);
+    btn.textContent = origLabel;
+    btn.disabled    = false;
+    input.value     = '';
+  }}
+}}
+
+// ── Refresh activity cards ────────────────────────────────────────────
+
 async function refreshActivities() {{
   try {{
     const resp = await fetch('/api/dashboard-cards', {{
       headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
     }});
     if (resp.ok) {{
-      const html = await resp.text();
-      document.getElementById('activity-container').innerHTML = html;
+      document.getElementById('activity-container').innerHTML = await resp.text();
     }} else {{
-      // Fallback: full page reload
       window.location.reload();
     }}
   }} catch (_) {{
@@ -1905,22 +1924,16 @@ async function refreshActivities() {{
 
 // ── Delete-confirm dialog ─────────────────────────────────────────────
 
-let _pendingDeleteId = null;   // activity_id awaiting user confirmation
+let _pendingDeleteId = null;
 
 function openDeleteConfirm(activityId) {{
   _pendingDeleteId = activityId;
-
-  // Build confirmation message
   document.getElementById('del-body').innerHTML =
-    `Are you sure you want to delete activity <code>${{activityId}}</code>?` +
-    `<br><br>All activity records, including submissions, will be deleted as well.`;
-
-  // Reset button states
+    'Are you sure you want to delete activity <code>' + activityId + '</code>?' +
+    '<br><br>All activity records, including submissions, will be deleted as well.';
   document.getElementById('btn-confirm-delete').disabled = false;
   document.getElementById('btn-no-delete').disabled      = false;
   document.getElementById('del-spinner').style.display   = 'none';
-
-  // Open overlay and focus the safe "Do NOT Delete" button
   document.getElementById('delete-overlay').classList.add('open');
   setTimeout(() => document.getElementById('btn-no-delete').focus(), 50);
 }}
@@ -1930,7 +1943,6 @@ function closeDeleteConfirm() {{
   _pendingDeleteId = null;
 }}
 
-// Close on backdrop click
 document.getElementById('delete-overlay').addEventListener('click', function(e) {{
   if (e.target === this) closeDeleteConfirm();
 }});
@@ -1939,36 +1951,33 @@ async function confirmDelete() {{
   if (!_pendingDeleteId) return;
   const activityId = _pendingDeleteId;
 
-  // Lock UI during the request
   document.getElementById('btn-confirm-delete').disabled = true;
   document.getElementById('btn-no-delete').disabled      = true;
   document.getElementById('del-spinner').style.display   = 'block';
 
   try {{
-    const resp = await fetch(`/api/activity/${{encodeURIComponent(activityId)}}`, {{
+    const resp = await fetch('/api/activity/' + encodeURIComponent(activityId), {{
       method:  'DELETE',
       headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
     }});
 
     if (!resp.ok) {{
       const data = await resp.json().catch(() => ({{}}));
-      const msg  = data.detail || `Server error ${{resp.status}}`;
-      // Show error inside confirm dialog body before re-enabling buttons
       document.getElementById('del-body').innerHTML +=
-        `<br><br><span style="color:#a50e0e;font-weight:600">Error: ${{msg}}</span>`;
+        '<br><br><span style="color:#a50e0e;font-weight:600">Error: ' +
+        (data.detail || 'Server error ' + resp.status) + '</span>';
       document.getElementById('btn-confirm-delete').disabled = false;
       document.getElementById('btn-no-delete').disabled      = false;
       document.getElementById('del-spinner').style.display   = 'none';
       return;
     }}
 
-    // Success — close dialog and refresh card list
     closeDeleteConfirm();
     await refreshActivities();
 
   }} catch (err) {{
     document.getElementById('del-body').innerHTML +=
-      `<br><br><span style="color:#a50e0e;font-weight:600">Network error: ${{err.message}}</span>`;
+      '<br><br><span style="color:#a50e0e;font-weight:600">Network error: ' + err.message + '</span>';
     document.getElementById('btn-confirm-delete').disabled = false;
     document.getElementById('btn-no-delete').disabled      = false;
     document.getElementById('del-spinner').style.display   = 'none';
@@ -1982,6 +1991,167 @@ async function confirmDelete() {{
     # Persist token in a cookie so the user stays logged in across refreshes
     response.set_cookie("google_token", token, httponly=True, samesite="lax")
     return response
+
+
+@app.post("/api/activity/roster/update")
+async def update_roster(
+    request: Request,
+    roster: UploadFile = File(...),
+    activity_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Update the enrollment list for an existing activity from a new CSV roster.
+
+    • Users in the CSV who are not yet enrolled → added (user created if needed).
+    • Users currently enrolled as Students who are absent from the CSV → removed.
+      If a removed user has no other activity enrollments, the user record is also
+      deleted.
+    • Non-Student enrollments (Instructor, TA, Admin) are never removed.
+    • Existing enrollments whose role changed in the CSV are updated.
+
+    Requires a valid instructor Bearer token.
+    """
+    instructor = require_instructor(request, db)
+
+    activity = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Verify this instructor owns the activity
+    if activity not in instructor.activities:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not assigned to this activity",
+        )
+
+    # ── Parse CSV ──────────────────────────────────────────────────────
+    raw_bytes = await roster.read()
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw_bytes.decode("latin-1")
+
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Roster CSV is empty")
+
+    required_cols = {"Email", "Role"}
+    missing = required_cols - set(reader.fieldnames or [])
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV is missing required columns: {missing}",
+        )
+
+    for idx, row in enumerate(rows, start=2):
+        role = row.get("Role", "").strip()
+        if role not in _VALID_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Row {idx}: invalid Role '{role}'. Must be one of {sorted(_VALID_ROLES)}.",
+            )
+
+    # ── Build the set of emails in the new roster ──────────────────────
+    roster_emails = {
+        r["Email"].strip().lower()
+        for r in rows
+        if r.get("Email", "").strip()
+    }
+
+    # ── Remove Student enrollments not in the new roster ──────────────
+    removed_count = 0
+    current_student_uas = (
+        db.query(UserActivity)
+        .filter(
+            UserActivity.activity_id == activity_id,
+            UserActivity.role        == "Student",
+        )
+        .all()
+    )
+    for ua in current_student_uas:
+        user = db.query(User).filter(User.id == ua.user_id).first()
+        if not user:
+            continue
+        if user.email.lower() not in roster_emails:
+            # Delete submissions for this enrollment
+            db.query(Submission).filter(
+                Submission.user_activity_id == ua.id
+            ).delete(synchronize_session=False)
+            db.delete(ua)
+            db.flush()
+            # Delete the user entirely if they have no remaining enrollments
+            remaining = (
+                db.query(UserActivity)
+                .filter(UserActivity.user_id == user.id)
+                .count()
+            )
+            if remaining == 0:
+                db.delete(user)
+            removed_count += 1
+
+    db.flush()
+
+    # ── Upsert users and enrollments for every row in the new roster ───
+    added_count   = 0
+    updated_count = 0
+
+    for row in rows:
+        email = row.get("Email", "").strip()
+        if not email:
+            continue
+
+        first = row.get("First Name", "").strip()
+        last  = row.get("Last Name",  "").strip()
+        if first and last:
+            name = f"{first} {last}"
+        elif first:
+            name = first
+        elif last:
+            name = last
+        else:
+            name = email
+
+        role = row.get("Role", "").strip()
+
+        # Upsert user
+        user = db.query(User).filter(User.email == email).first()
+        if user:
+            if name and name != user.name:
+                user.name = name
+        else:
+            user = User(name=name, email=email)
+            db.add(user)
+            db.flush()
+
+        # Upsert enrollment
+        ua = (
+            db.query(UserActivity)
+            .filter(
+                UserActivity.user_id     == user.id,
+                UserActivity.activity_id == activity_id,
+            )
+            .first()
+        )
+        if ua:
+            if ua.role != role:
+                ua.role = role
+                updated_count += 1
+        else:
+            db.add(UserActivity(user_id=user.id, activity_id=activity_id, role=role))
+            added_count += 1
+
+    db.commit()
+    return {
+        "status":        "ok",
+        "activity_id":   activity_id,
+        "added_count":   added_count,
+        "removed_count": removed_count,
+        "updated_count": updated_count,
+    }
 
 
 @app.get("/api/dashboard-cards", response_class=HTMLResponse)
