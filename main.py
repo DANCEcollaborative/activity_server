@@ -23,6 +23,7 @@ DELETE /api/activity/{activity_id}      – delete an activity
 GET    /api/activities                  – list activities
 
 POST   /api/activity/roster             – upload a CSV roster to create/update an activity and enroll users
+POST   /api/activity/roster/update      – update enrollment for an existing activity from a new CSV roster
 
 POST   /api/instructor                  – add instructor / assign activity
 
@@ -364,15 +365,46 @@ async def create_or_update_activity(
 
 
 @app.delete("/api/activity/{activity_id}")
-async def delete_activity(activity_id: str, db: Session = Depends(get_db)):
+async def delete_activity(
+    activity_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Delete an activity and cascade-remove all associated user_activities and
+    submissions.  Requires a valid instructor Bearer token.
+    """
+    require_instructor(request, db)
+
     activity = db.query(Activity).filter(
         Activity.activity_id == activity_id
     ).first()
     if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Collect every UserActivity for this activity
+    user_activities = (
+        db.query(UserActivity)
+        .filter(UserActivity.activity_id == activity_id)
+        .all()
+    )
+
+    # Delete all Submissions for each enrollment
+    for ua in user_activities:
+        db.query(Submission).filter(
+            Submission.user_activity_id == ua.id
+        ).delete(synchronize_session=False)
+
+    # Delete all UserActivity rows
+    db.query(UserActivity).filter(
+        UserActivity.activity_id == activity_id
+    ).delete(synchronize_session=False)
+
+    # Delete the Activity itself (also removes activity_instructors join rows
+    # via the CASCADE defined on the FK)
     db.delete(activity)
     db.commit()
-    return {"status": "deleted"}
+    return {"status": "deleted", "activity_id": activity_id}
 
 
 @app.get("/api/activities")
@@ -545,6 +577,7 @@ async def upload_roster(
                 """Lower-case s, replace non-[a-z0-9] runs with '-', strip edge hyphens."""
                 return _re.sub(r'^-+|-+$', '', _re.sub(r'[^a-z0-9]+', '-', s.lower()))
 
+            # Order: name - section - year - semester
             parts = [_to_rfc1123_segment(p) for p in
                      [activity_name, section, str(year), semester] if p]
             parts = [p for p in parts if p]   # drop any empty segments
@@ -1228,6 +1261,77 @@ DASHBOARD_CSS = """
     border-radius: 50%; animation: spin .7s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Activity card header row ── */
+  .activity-card h2 {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  }
+  .activity-card h2 .h2-title { flex: 1; }
+
+  /* ── Update Roster button (per-card) ── */
+  .btn-update-roster {
+    background: #137333; color: white; border: none; border-radius: 5px;
+    padding: 4px 11px; font-size: .78rem; font-weight: 600; cursor: pointer;
+    white-space: nowrap; transition: background .15s; flex-shrink: 0;
+  }
+  .btn-update-roster:hover { background: #0d5226; }
+
+  /* ── Delete Activity button (per-card) ── */
+  .btn-delete-activity {
+    background: #d93025; color: white; border: none; border-radius: 5px;
+    padding: 4px 11px; font-size: .78rem; font-weight: 600; cursor: pointer;
+    white-space: nowrap; transition: background .15s; flex-shrink: 0;
+  }
+  .btn-delete-activity:hover { background: #a50e0e; }
+
+  /* ── Delete-confirm dialog (reuses modal-overlay) ── */
+  .confirm-dialog {
+    background: #fff0f0; border: 2px solid #d93025;
+    border-radius: 10px; width: 480px; max-width: 95vw;
+    box-shadow: 0 8px 32px rgba(0,0,0,.25);
+    display: flex; flex-direction: column;
+  }
+  .confirm-header {
+    padding: 16px 20px 12px; border-bottom: 1px solid #f28b82;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .confirm-header h2 {
+    margin: 0; font-size: 1rem; color: #a50e0e; flex: 1;
+    display: block;   /* override the flex rule above for this h2 */
+  }
+  .confirm-body {
+    padding: 18px 20px; font-size: .9rem; color: #3c1010; line-height: 1.55;
+  }
+  .confirm-body code {
+    background: #fce8e6; padding: 1px 5px; border-radius: 3px;
+    font-size: .88rem; color: #a50e0e;
+  }
+  .confirm-footer {
+    padding: 12px 20px 16px; display: flex; gap: 10px;
+    justify-content: flex-end; background: #fff5f5;
+    border-top: 1px solid #f28b82; border-radius: 0 0 8px 8px;
+  }
+  /* "Do NOT Delete" — green, slightly larger */
+  .btn-no-delete {
+    padding: 9px 22px; background: #137333; color: white; border: none;
+    border-radius: 6px; font-size: .95rem; font-weight: 700; cursor: pointer;
+    transition: background .15s;
+  }
+  .btn-no-delete:hover { background: #0d5226; }
+  /* "DELETE" — red, slightly smaller */
+  .btn-confirm-delete {
+    padding: 7px 18px; background: #d93025; color: white; border: none;
+    border-radius: 6px; font-size: .85rem; font-weight: 600; cursor: pointer;
+    transition: background .15s;
+  }
+  .btn-confirm-delete:hover:not(:disabled) { background: #a50e0e; }
+  .btn-confirm-delete:disabled { background: #f28b82; cursor: default; }
+  /* delete spinner (red tones) */
+  .del-spinner {
+    display: none; width: 16px; height: 16px;
+    border: 3px solid #f28b82; border-top-color: #d93025;
+    border-radius: 50%; animation: spin .7s linear infinite;
+  }
 </style>
 """
 
@@ -1292,10 +1396,26 @@ def _build_activity_cards(instructor, db) -> str:
         meta_str = " · ".join(meta_parts)
         meta_html = f'<span class="activity-meta">{meta_str}</span>' if meta_str else ""
 
+        # Escape activity_id for safe use in JS string (single-quoted)
+        safe_act_id = act.activity_id.replace("'", "\\'")
+
         cards += f"""
         <div class="activity-card">
-          <h2>{act.activity_name}{meta_html}
+          <h2>
+            <span class="h2-title">{act.activity_name}{meta_html}
               <small style="color:#bbb;font-size:.75rem;margin-left:6px">({act.activity_id})</small>
+            </span>
+            <button class="btn-update-roster"
+                    onclick="document.getElementById('ur-input-{act.activity_id}').click()">
+              ↺ Update Roster
+            </button>
+            <input type="file" id="ur-input-{act.activity_id}"
+                   accept=".csv,text/csv" style="display:none"
+                   onchange="onUpdateRosterChosen(this, '{safe_act_id}')">
+            <button class="btn-delete-activity"
+                    onclick="openDeleteConfirm('{safe_act_id}')">
+              🗑 Delete Activity
+            </button>
           </h2>
           <table>
             <thead>
@@ -1310,6 +1430,380 @@ def _build_activity_cards(instructor, db) -> str:
         </div>"""
 
     return cards or "<p style='color:#888'>No activities assigned yet.</p>"
+
+
+# Pre-built JS block for the instructor dashboard.
+# Kept outside the f-string to avoid Python escaping issues with
+# backslashes in the RFC 1123 regex.  Token/email are injected at
+# runtime via str.replace() on the two placeholder strings.
+_DASHBOARD_JS = r"""// ── Globals ──────────────────────────────────────────────────────────
+const BEARER_TOKEN     = `__BEARER_TOKEN__`;
+const INSTRUCTOR_EMAIL = `__INSTRUCTOR_EMAIL__`;
+
+// RFC 1123 subdomain validation.
+const RFC1123_RE = new RegExp(
+  '^[a-z0-9]([-a-z0-9]*[a-z0-9])?' +
+  '(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+);
+
+// ── RFC 1123 slug helpers ────────────────────────────────────────────
+
+function toRFC1123Segment(str) {
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function buildAutoId() {
+  const name     = document.getElementById('f-activity-name').value.trim();
+  const year     = document.getElementById('f-year').value.trim();
+  const semester = document.getElementById('f-semester').value;
+  const section  = window._rosterSection || '';
+
+  if (!name || !year || !semester) return '';
+
+  const rawParts = section
+    ? [name, section, year, semester]
+    : [name, year, semester];
+
+  const parts = rawParts.map(toRFC1123Segment).filter(Boolean);
+  if (parts.length < (section ? 4 : 3)) return '';
+
+  const candidate = parts.join('-');
+  return RFC1123_RE.test(candidate) ? candidate : '';
+}
+
+// ── Activity-ID live update & validation ─────────────────────────────
+
+function updateActivityId() {
+  const idField = document.getElementById('f-activity-id');
+  if (idField.dataset.manual === 'true') return;
+  const auto = buildAutoId();
+  idField.value = auto;
+  refreshIdBadge(auto);
+}
+
+function onActivityIdInput(input) {
+  const pos = input.selectionStart;
+  input.value = input.value.toLowerCase();
+  input.setSelectionRange(pos, pos);
+  input.dataset.manual = input.value !== '' ? 'true' : 'false';
+  refreshIdBadge(input.value);
+}
+
+function refreshIdBadge(value) {
+  const badge = document.getElementById('id-valid-badge');
+  if (!value) { badge.style.display = 'none'; return; }
+  const ok = RFC1123_RE.test(value);
+  badge.style.display    = 'inline';
+  badge.textContent      = ok ? '\u2713 valid' : '\u2717 invalid format';
+  badge.style.background = ok ? '#e6f4ea' : '#fce8e6';
+  badge.style.color      = ok ? '#137333' : '#c5221f';
+}
+
+// ── Add-Activity modal open / close ──────────────────────────────────
+
+function openModal() {
+  document.getElementById('modal-overlay').classList.add('open');
+  resetModal();
+  document.getElementById('f-activity-name').focus();
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+
+document.getElementById('modal-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') { closeModal(); closeDeleteConfirm(); }
+});
+
+['f-activity-name', 'f-year', 'f-semester'].forEach(function(id) {
+  const el  = document.getElementById(id);
+  const evt = (el.tagName === 'SELECT') ? 'change' : 'input';
+  el.addEventListener(evt, updateActivityId);
+});
+
+// ── Add-Activity modal helpers ────────────────────────────────────────
+
+function resetModal() {
+  document.getElementById('f-activity-name').value = '';
+  document.getElementById('f-year').value           = '';
+  document.getElementById('f-semester').value       = '';
+  const idField = document.getElementById('f-activity-id');
+  idField.value          = '';
+  idField.dataset.manual = 'false';
+  document.getElementById('id-valid-badge').style.display  = 'none';
+  document.getElementById('f-roster').value                = '';
+  document.getElementById('file-name-display').textContent = 'No file chosen';
+  window._rosterSection = '';
+  hideError();
+  hideSuccess();
+  setLoading(false);
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = msg;
+  el.classList.add('visible');
+  document.getElementById('success-banner').classList.remove('visible');
+}
+
+function hideError() {
+  document.getElementById('error-banner').classList.remove('visible');
+}
+
+function showSuccess(msg) {
+  const el = document.getElementById('success-banner');
+  el.textContent = msg;
+  el.classList.add('visible');
+  document.getElementById('error-banner').classList.remove('visible');
+}
+
+function hideSuccess() {
+  document.getElementById('success-banner').classList.remove('visible');
+}
+
+function setLoading(on) {
+  document.getElementById('spinner').style.display  = on ? 'block' : 'none';
+  document.getElementById('submit-btn').disabled    = on;
+}
+
+function onFileChosen(input) {
+  document.getElementById('file-name-display').textContent =
+    input.files.length ? input.files[0].name : 'No file chosen';
+
+  window._rosterSection = '';
+  if (!input.files.length) { updateActivityId(); return; }
+
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const text    = e.target.result;
+      const lines   = text.split(/\r?\n/).filter(l => l.trim());
+      if (lines.length < 2) { updateActivityId(); return; }
+      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const secIdx  = headers.findIndex(h => h.toLowerCase() === 'section');
+      if (secIdx === -1) { updateActivityId(); return; }
+      const firstRow = lines[1].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+      window._rosterSection = firstRow[secIdx] || '';
+    } catch (_) {
+      window._rosterSection = '';
+    }
+    updateActivityId();
+  };
+  reader.readAsText(input.files[0]);
+}
+
+// ── Add-Activity submit ───────────────────────────────────────────────
+
+async function submitRoster() {
+  hideError();
+  hideSuccess();
+
+  const activityName = document.getElementById('f-activity-name').value.trim();
+  const year         = document.getElementById('f-year').value.trim();
+  const semester     = document.getElementById('f-semester').value;
+  const activityId   = document.getElementById('f-activity-id').value.trim();
+  const rosterInput  = document.getElementById('f-roster');
+
+  if (!activityName)             { showError('Activity Name is required.'); return; }
+  if (!year)                     { showError('Year is required.'); return; }
+  if (!semester)                 { showError('Semester is required.'); return; }
+  if (!rosterInput.files.length) { showError('Please choose a roster CSV file.'); return; }
+
+  const yearInt = parseInt(year, 10);
+  if (isNaN(yearInt) || yearInt < 2000 || yearInt > 2099) {
+    showError('Year must be a 4-digit number between 2000 and 2099.');
+    return;
+  }
+
+  if (activityId && !RFC1123_RE.test(activityId)) {
+    showError(
+      'Activity ID has an invalid format.\n' +
+      'Use only lowercase letters, digits, hyphens (-) and dots (.).\n' +
+      'Must start and end with a letter or digit.\n' +
+      'Example: intro-to-ai-11637-b-2024-fall'
+    );
+    return;
+  }
+
+  setLoading(true);
+
+  const fd = new FormData();
+  fd.append('activity_name',    activityName);
+  fd.append('year',             String(yearInt));
+  fd.append('semester',         semester);
+  fd.append('instructor_email', INSTRUCTOR_EMAIL);
+  fd.append('roster',           rosterInput.files[0]);
+  if (activityId) fd.append('activity_id', activityId);
+
+  try {
+    const resp = await fetch('/api/activity/roster', {
+      method:  'POST',
+      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+      body:    fd,
+    });
+
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      showError(typeof data.detail === 'string'
+        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
+      setLoading(false);
+      return;
+    }
+
+    const label = data.is_new_activity ? 'created' : 'updated';
+    showSuccess(
+      'Activity "' + data.activity_name + '" ' + label + ' \u00b7 ' +
+      data.enrolled_count + ' enrolled, ' + data.skipped_count + ' updated.'
+    );
+    setTimeout(async () => {
+      closeModal();
+      await refreshActivities();
+    }, 1200);
+
+  } catch (err) {
+    showError('Network error: ' + err.message);
+    setLoading(false);
+  }
+}
+
+// ── Update Roster (per-card file input) ──────────────────────────────
+
+async function onUpdateRosterChosen(input, activityId) {
+  if (!input.files.length) return;
+  const file = input.files[0];
+
+  const btn = input.previousElementSibling;
+  const origLabel = btn.textContent;
+  btn.textContent = '\u23f3 Uploading\u2026';
+  btn.disabled    = true;
+
+  const fd = new FormData();
+  fd.append('activity_id', activityId);
+  fd.append('roster',      file);
+
+  try {
+    const resp = await fetch('/api/activity/roster/update', {
+      method:  'POST',
+      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+      body:    fd,
+    });
+
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      const msg = typeof data.detail === 'string'
+        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status);
+      alert('Update Roster failed:\n\n' + msg);
+      btn.textContent = origLabel;
+      btn.disabled    = false;
+      input.value     = '';
+      return;
+    }
+
+    await refreshActivities();
+
+  } catch (err) {
+    alert('Network error: ' + err.message);
+    btn.textContent = origLabel;
+    btn.disabled    = false;
+    input.value     = '';
+  }
+}
+
+// ── Refresh activity cards ────────────────────────────────────────────
+
+async function refreshActivities() {
+  try {
+    const resp = await fetch('/api/dashboard-cards', {
+      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+    });
+    if (resp.ok) {
+      document.getElementById('activity-container').innerHTML = await resp.text();
+    } else {
+      window.location.reload();
+    }
+  } catch (_) {
+    window.location.reload();
+  }
+}
+
+// ── Delete-confirm dialog ─────────────────────────────────────────────
+
+let _pendingDeleteId = null;
+
+function openDeleteConfirm(activityId) {
+  _pendingDeleteId = activityId;
+  document.getElementById('del-body').innerHTML =
+    'Are you sure you want to delete activity <code>' + activityId + '</code>?' +
+    '<br><br>All activity records, including submissions, will be deleted as well.';
+  document.getElementById('btn-confirm-delete').disabled = false;
+  document.getElementById('btn-no-delete').disabled      = false;
+  document.getElementById('del-spinner').style.display   = 'none';
+  document.getElementById('delete-overlay').classList.add('open');
+  setTimeout(() => document.getElementById('btn-no-delete').focus(), 50);
+}
+
+function closeDeleteConfirm() {
+  document.getElementById('delete-overlay').classList.remove('open');
+  _pendingDeleteId = null;
+}
+
+document.getElementById('delete-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeDeleteConfirm();
+});
+
+async function confirmDelete() {
+  if (!_pendingDeleteId) return;
+  const activityId = _pendingDeleteId;
+
+  document.getElementById('btn-confirm-delete').disabled = true;
+  document.getElementById('btn-no-delete').disabled      = true;
+  document.getElementById('del-spinner').style.display   = 'block';
+
+  try {
+    const resp = await fetch('/api/activity/' + encodeURIComponent(activityId), {
+      method:  'DELETE',
+      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+    });
+
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      document.getElementById('del-body').innerHTML +=
+        '<br><br><span style="color:#a50e0e;font-weight:600">Error: ' +
+        (data.detail || 'Server error ' + resp.status) + '</span>';
+      document.getElementById('btn-confirm-delete').disabled = false;
+      document.getElementById('btn-no-delete').disabled      = false;
+      document.getElementById('del-spinner').style.display   = 'none';
+      return;
+    }
+
+    closeDeleteConfirm();
+    await refreshActivities();
+
+  } catch (err) {
+    document.getElementById('del-body').innerHTML +=
+      '<br><br><span style="color:#a50e0e;font-weight:600">Network error: ' + err.message + '</span>';
+    document.getElementById('btn-confirm-delete').disabled = false;
+    document.getElementById('btn-no-delete').disabled      = false;
+    document.getElementById('del-spinner').style.display   = 'none';
+  }
+}"""
+
+
+def _build_dashboard_script(safe_token: str, safe_email: str) -> str:
+    """Return the full <script>…</script> block with token/email injected."""
+    js = _DASHBOARD_JS
+    js = js.replace('__BEARER_TOKEN__',     safe_token)
+    js = js.replace('__INSTRUCTOR_EMAIL__', safe_email)
+    return '<script>\n' + js + '\n</script>'
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -1471,270 +1965,33 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
   </div><!-- /modal -->
 </div><!-- /modal-overlay -->
 
-<script>
-// ── Globals ──────────────────────────────────────────────────────────
-const BEARER_TOKEN = `{safe_token}`;
-const INSTRUCTOR_EMAIL = `{safe_email}`;
+<!-- ═══════════════════════════════════════════
+     Delete-confirm dialog  (reuses modal-overlay pattern)
+════════════════════════════════════════════ -->
+<div class="modal-overlay" id="delete-overlay" role="dialog"
+     aria-modal="true" aria-labelledby="del-title">
+  <div class="confirm-dialog">
 
-// RFC 1123 subdomain regex (as specified by Kubernetes / DNS naming rules)
-const RFC1123_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$/;
+    <div class="confirm-header">
+      <h2 id="del-title">⚠️ Confirm Deletion</h2>
+    </div>
 
-// ── RFC 1123 slug helpers ────────────────────────────────────────────
+    <div class="confirm-body" id="del-body">
+      <!-- filled by JS -->
+    </div>
 
-/**
- * Convert an arbitrary string to a valid RFC 1123 subdomain segment.
- *   1. Lower-case everything.
- *   2. Replace any run of characters that are not [a-z0-9] with a single '-'.
- *   3. Strip leading/trailing hyphens.
- */
-function toRFC1123Segment(str) {{
-  return str
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')   // non-alphanumeric runs → single hyphen
-    .replace(/^-+|-+$/g, '');       // strip leading/trailing hyphens
-}}
+    <div class="confirm-footer">
+      <div class="del-spinner" id="del-spinner"></div>
+      <button class="btn-no-delete"      id="btn-no-delete"
+              onclick="closeDeleteConfirm()">Do NOT Delete</button>
+      <button class="btn-confirm-delete" id="btn-confirm-delete"
+              onclick="confirmDelete()">DELETE</button>
+    </div>
 
-/**
- * Build the auto-generated activity_id from the four source fields.
- * Segments are joined with '-' and the whole string is validated.
- * Returns '' if any required segment is empty or the result is invalid.
- */
-function buildAutoId() {{
-  const name     = document.getElementById('f-activity-name').value.trim();
-  const year     = document.getElementById('f-year').value.trim();
-  const semester = document.getElementById('f-semester').value;
+  </div>
+</div>
 
-  // Section comes from the roster file, which hasn't been parsed yet in the
-  // browser, so we omit it from the auto-generated preview (the server will
-  // incorporate it after parsing the CSV).
-  if (!name || !year || !semester) return '';
-
-  const parts = [name, year, semester].map(toRFC1123Segment).filter(Boolean);
-  if (parts.length < 3) return '';
-
-  const candidate = parts.join('-');
-  return RFC1123_RE.test(candidate) ? candidate : '';
-}}
-
-// ── Activity-ID live update & validation ─────────────────────────────
-
-/**
- * Called whenever any of the three auto-generation source fields change.
- * Only overwrites the Activity ID field when the user hasn't manually
- * edited it (tracked by the data-manual attribute).
- */
-function updateActivityId() {{
-  const idField = document.getElementById('f-activity-id');
-  if (idField.dataset.manual === 'true') return;   // user has taken over
-  const auto = buildAutoId();
-  idField.value = auto;
-  refreshIdBadge(auto);
-}}
-
-/**
- * Called on every keystroke in the Activity ID field itself.
- * Enforces lowercase in real-time and marks the field as manually edited.
- */
-function onActivityIdInput(input) {{
-  // Enforce lowercase as the user types
-  const pos = input.selectionStart;
-  input.value = input.value.toLowerCase();
-  input.setSelectionRange(pos, pos);
-
-  input.dataset.manual = input.value !== '' ? 'true' : 'false';
-  refreshIdBadge(input.value);
-}}
-
-/**
- * Show a ✓ / ✗ badge next to the Activity ID label indicating RFC 1123
- * validity.  Hidden when the field is empty (will be auto-generated).
- */
-function refreshIdBadge(value) {{
-  const badge = document.getElementById('id-valid-badge');
-  if (!value) {{
-    badge.style.display = 'none';
-    return;
-  }}
-  const ok = RFC1123_RE.test(value);
-  badge.style.display     = 'inline';
-  badge.textContent       = ok ? '✓ valid' : '✗ invalid format';
-  badge.style.background  = ok ? '#e6f4ea' : '#fce8e6';
-  badge.style.color       = ok ? '#137333' : '#c5221f';
-}}
-
-// ── Modal open / close ───────────────────────────────────────────────
-function openModal() {{
-  document.getElementById('modal-overlay').classList.add('open');
-  resetModal();
-  document.getElementById('f-activity-name').focus();
-}}
-
-function closeModal() {{
-  document.getElementById('modal-overlay').classList.remove('open');
-}}
-
-// Close on backdrop click
-document.getElementById('modal-overlay').addEventListener('click', function(e) {{
-  if (e.target === this) closeModal();
-}});
-
-// Close on Escape
-document.addEventListener('keydown', function(e) {{
-  if (e.key === 'Escape') closeModal();
-}});
-
-// Wire auto-generation to source fields
-['f-activity-name', 'f-year', 'f-semester'].forEach(function(id) {{
-  const el = document.getElementById(id);
-  const evt = (el.tagName === 'SELECT') ? 'change' : 'input';
-  el.addEventListener(evt, updateActivityId);
-}});
-
-// ── Helpers ──────────────────────────────────────────────────────────
-function resetModal() {{
-  document.getElementById('f-activity-name').value = '';
-  document.getElementById('f-year').value = '';
-  document.getElementById('f-semester').value = '';
-  const idField = document.getElementById('f-activity-id');
-  idField.value = '';
-  idField.dataset.manual = 'false';
-  document.getElementById('id-valid-badge').style.display = 'none';
-  document.getElementById('f-roster').value = '';
-  document.getElementById('file-name-display').textContent = 'No file chosen';
-  hideError();
-  hideSuccess();
-  setLoading(false);
-}}
-
-function showError(msg) {{
-  const el = document.getElementById('error-banner');
-  el.textContent = msg;
-  el.classList.add('visible');
-  document.getElementById('success-banner').classList.remove('visible');
-}}
-
-function hideError() {{
-  document.getElementById('error-banner').classList.remove('visible');
-}}
-
-function showSuccess(msg) {{
-  const el = document.getElementById('success-banner');
-  el.textContent = msg;
-  el.classList.add('visible');
-  document.getElementById('error-banner').classList.remove('visible');
-}}
-
-function hideSuccess() {{
-  document.getElementById('success-banner').classList.remove('visible');
-}}
-
-function setLoading(on) {{
-  document.getElementById('spinner').style.display   = on ? 'block' : 'none';
-  document.getElementById('submit-btn').disabled     = on;
-}}
-
-function onFileChosen(input) {{
-  const display = document.getElementById('file-name-display');
-  display.textContent = input.files.length ? input.files[0].name : 'No file chosen';
-}}
-
-// ── Submit ────────────────────────────────────────────────────────────
-async function submitRoster() {{
-  hideError();
-  hideSuccess();
-
-  // Client-side validation
-  const activityName = document.getElementById('f-activity-name').value.trim();
-  const year         = document.getElementById('f-year').value.trim();
-  const semester     = document.getElementById('f-semester').value;
-  const activityId   = document.getElementById('f-activity-id').value.trim();
-  const rosterInput  = document.getElementById('f-roster');
-
-  if (!activityName) {{ showError('Activity Name is required.'); return; }}
-  if (!year)         {{ showError('Year is required.'); return; }}
-  if (!semester)     {{ showError('Semester is required.'); return; }}
-  if (!rosterInput.files.length) {{ showError('Please choose a roster CSV file.'); return; }}
-
-  const yearInt = parseInt(year, 10);
-  if (isNaN(yearInt) || yearInt < 2000 || yearInt > 2099) {{
-    showError('Year must be a 4-digit number between 2000 and 2099.');
-    return;
-  }}
-
-  // Validate Activity ID if the user supplied one manually
-  if (activityId && !RFC1123_RE.test(activityId)) {{
-    showError(
-      'Activity ID has an invalid format.\\n' +
-      'It must contain only lowercase letters, digits, hyphens (-) and dots (.), ' +
-      'and must start and end with a letter or digit.\\n' +
-      'Example: intro-to-ai-11637-b-2024-fall'
-    );
-    return;
-  }}
-
-  setLoading(true);
-
-  const fd = new FormData();
-  fd.append('activity_name',    activityName);
-  fd.append('year',             String(yearInt));
-  fd.append('semester',         semester);
-  fd.append('instructor_email', INSTRUCTOR_EMAIL);
-  fd.append('roster',           rosterInput.files[0]);
-  if (activityId) fd.append('activity_id', activityId);
-
-  try {{
-    const resp = await fetch('/api/activity/roster', {{
-      method:  'POST',
-      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
-      body:    fd,
-    }});
-
-    const data = await resp.json().catch(() => ({{}}));
-
-    if (!resp.ok) {{
-      const detail = data.detail || `Server error ${{resp.status}}`;
-      showError(typeof detail === 'string' ? detail : JSON.stringify(detail));
-      setLoading(false);
-      return;
-    }}
-
-    // ── Success: close modal, refresh activity list ────────────────
-    const label = data.is_new_activity ? 'created' : 'updated';
-    showSuccess(
-      `Activity "${{data.activity_name}}" ${{label}} · ` +
-      `${{data.enrolled_count}} enrolled, ${{data.skipped_count}} updated.`
-    );
-
-    // Slight delay so the user sees the success message, then reload cards
-    setTimeout(async () => {{
-      closeModal();
-      await refreshActivities();
-    }}, 1200);
-
-  }} catch (err) {{
-    showError('Network error: ' + err.message);
-    setLoading(false);
-  }}
-}}
-
-// ── Refresh activity cards without a full page reload ────────────────
-async function refreshActivities() {{
-  try {{
-    const resp = await fetch('/api/dashboard-cards', {{
-      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
-    }});
-    if (resp.ok) {{
-      const html = await resp.text();
-      document.getElementById('activity-container').innerHTML = html;
-    }} else {{
-      // Fallback: full page reload
-      window.location.reload();
-    }}
-  }} catch (_) {{
-    window.location.reload();
-  }}
-}}
-</script>
+{_build_dashboard_script(safe_token, safe_email)}
 
 </body>
 </html>"""
@@ -1742,6 +1999,167 @@ async function refreshActivities() {{
     # Persist token in a cookie so the user stays logged in across refreshes
     response.set_cookie("google_token", token, httponly=True, samesite="lax")
     return response
+
+
+@app.post("/api/activity/roster/update")
+async def update_roster(
+    request: Request,
+    roster: UploadFile = File(...),
+    activity_id: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Update the enrollment list for an existing activity from a new CSV roster.
+
+    • Users in the CSV who are not yet enrolled → added (user created if needed).
+    • Users currently enrolled as Students who are absent from the CSV → removed.
+      If a removed user has no other activity enrollments, the user record is also
+      deleted.
+    • Non-Student enrollments (Instructor, TA, Admin) are never removed.
+    • Existing enrollments whose role changed in the CSV are updated.
+
+    Requires a valid instructor Bearer token.
+    """
+    instructor = require_instructor(request, db)
+
+    activity = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    # Verify this instructor owns the activity
+    if activity not in instructor.activities:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not assigned to this activity",
+        )
+
+    # ── Parse CSV ──────────────────────────────────────────────────────
+    raw_bytes = await roster.read()
+    try:
+        text = raw_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw_bytes.decode("latin-1")
+
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Roster CSV is empty")
+
+    required_cols = {"Email", "Role"}
+    missing = required_cols - set(reader.fieldnames or [])
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV is missing required columns: {missing}",
+        )
+
+    for idx, row in enumerate(rows, start=2):
+        role = row.get("Role", "").strip()
+        if role not in _VALID_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Row {idx}: invalid Role '{role}'. Must be one of {sorted(_VALID_ROLES)}.",
+            )
+
+    # ── Build the set of emails in the new roster ──────────────────────
+    roster_emails = {
+        r["Email"].strip().lower()
+        for r in rows
+        if r.get("Email", "").strip()
+    }
+
+    # ── Remove Student enrollments not in the new roster ──────────────
+    removed_count = 0
+    current_student_uas = (
+        db.query(UserActivity)
+        .filter(
+            UserActivity.activity_id == activity_id,
+            UserActivity.role        == "Student",
+        )
+        .all()
+    )
+    for ua in current_student_uas:
+        user = db.query(User).filter(User.id == ua.user_id).first()
+        if not user:
+            continue
+        if user.email.lower() not in roster_emails:
+            # Delete submissions for this enrollment
+            db.query(Submission).filter(
+                Submission.user_activity_id == ua.id
+            ).delete(synchronize_session=False)
+            db.delete(ua)
+            db.flush()
+            # Delete the user entirely if they have no remaining enrollments
+            remaining = (
+                db.query(UserActivity)
+                .filter(UserActivity.user_id == user.id)
+                .count()
+            )
+            if remaining == 0:
+                db.delete(user)
+            removed_count += 1
+
+    db.flush()
+
+    # ── Upsert users and enrollments for every row in the new roster ───
+    added_count   = 0
+    updated_count = 0
+
+    for row in rows:
+        email = row.get("Email", "").strip()
+        if not email:
+            continue
+
+        first = row.get("First Name", "").strip()
+        last  = row.get("Last Name",  "").strip()
+        if first and last:
+            name = f"{first} {last}"
+        elif first:
+            name = first
+        elif last:
+            name = last
+        else:
+            name = email
+
+        role = row.get("Role", "").strip()
+
+        # Upsert user
+        user = db.query(User).filter(User.email == email).first()
+        if user:
+            if name and name != user.name:
+                user.name = name
+        else:
+            user = User(name=name, email=email)
+            db.add(user)
+            db.flush()
+
+        # Upsert enrollment
+        ua = (
+            db.query(UserActivity)
+            .filter(
+                UserActivity.user_id     == user.id,
+                UserActivity.activity_id == activity_id,
+            )
+            .first()
+        )
+        if ua:
+            if ua.role != role:
+                ua.role = role
+                updated_count += 1
+        else:
+            db.add(UserActivity(user_id=user.id, activity_id=activity_id, role=role))
+            added_count += 1
+
+    db.commit()
+    return {
+        "status":        "ok",
+        "activity_id":   activity_id,
+        "added_count":   added_count,
+        "removed_count": removed_count,
+        "updated_count": updated_count,
+    }
 
 
 @app.get("/api/dashboard-cards", response_class=HTMLResponse)
