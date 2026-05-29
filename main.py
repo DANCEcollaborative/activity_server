@@ -338,6 +338,7 @@ async def create_or_update_activity(
     ).first()
 
     if activity:
+        # 3g: activity_name CAN be updated; activity_id cannot (it's the PK)
         activity.activity_name = activity_name
         activity.enabled = enabled
         if task_graders is not None:
@@ -405,6 +406,25 @@ async def delete_activity(
     db.delete(activity)
     db.commit()
     return {"status": "deleted", "activity_id": activity_id}
+
+
+@app.patch("/api/activity/{activity_id}/enabled")
+async def toggle_activity_enabled(
+    activity_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Toggle the enabled flag on an activity. Body: {"enabled": true|false}"""
+    require_instructor(request, db)
+    activity = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    body = await request.json()
+    activity.enabled = bool(body.get("enabled", not activity.enabled))
+    db.commit()
+    return {"status": "ok", "activity_id": activity_id, "enabled": activity.enabled}
 
 
 @app.get("/api/activities")
@@ -577,9 +597,9 @@ async def upload_roster(
                 """Lower-case s, replace non-[a-z0-9] runs with '-', strip edge hyphens."""
                 return _re.sub(r'^-+|-+$', '', _re.sub(r'[^a-z0-9]+', '-', s.lower()))
 
-            # Order: name - section - year - semester
+            # Order: name - year - semester - section  (matches frontend 3e)
             parts = [_to_rfc1123_segment(p) for p in
-                     [activity_name, section, str(year), semester] if p]
+                     [activity_name, str(year), semester, section] if p]
             parts = [p for p in parts if p]   # drop any empty segments
             activity_id = '-'.join(parts)
 
@@ -1268,7 +1288,18 @@ DASHBOARD_CSS = """
   }
   .activity-card h2 .h2-title { flex: 1; }
 
-  /* ── Update Roster button (per-card) ── */
+  /* ── Enable/Disable toggle button (per-card) ── */
+  .btn-toggle-activity {
+    border: none; border-radius: 5px;
+    padding: 4px 11px; font-size: .78rem; font-weight: 600; cursor: pointer;
+    white-space: nowrap; transition: background .15s; flex-shrink: 0;
+  }
+  .btn-toggle-activity.enabled  { background: #1a73e8; color: white; }
+  .btn-toggle-activity.enabled:hover  { background: #1558b0; }
+  .btn-toggle-activity.disabled { background: #5f6368; color: white; }
+  .btn-toggle-activity.disabled:hover { background: #3c4043; }
+
+  /* ── Update Activity button (per-card) ── */
   .btn-update-roster {
     background: #137333; color: white; border: none; border-radius: 5px;
     padding: 4px 11px; font-size: .78rem; font-weight: 600; cursor: pointer;
@@ -1399,15 +1430,43 @@ def _build_activity_cards(instructor, db) -> str:
         # Escape activity_id for safe use in JS string (single-quoted)
         safe_act_id = act.activity_id.replace("'", "\\'")
 
+        # Enable/Disable toggle button
+        if act.enabled:
+            toggle_cls   = "btn-toggle-activity enabled"
+            toggle_label = "Disable"
+            toggle_title = "Click to disable this activity"
+        else:
+            toggle_cls   = "btn-toggle-activity disabled"
+            toggle_label = "Enable"
+            toggle_title = "Click to enable this activity"
+
+        # Disabled badge in title
+        disabled_badge = (
+            '' if act.enabled
+            else ' <span style="background:#e8eaed;color:#5f6368;font-size:.72rem;'
+                 'font-weight:600;padding:1px 7px;border-radius:10px;vertical-align:middle">'
+                 'DISABLED</span>'
+        )
+
+        # Build JS object of activity data for the update modal
+        safe_act_name = act.activity_name.replace("'", "\\'").replace("\\", "\\\\")
+        safe_semester = (act.semester or "").replace("'", "\\'")
+        safe_graders  = (act.task_graders or "").replace("'", "\\'").replace("\\", "\\\\")
+        act_year      = act.year or ""
+
         cards += f"""
         <div class="activity-card">
           <h2>
-            <span class="h2-title">{act.activity_name}{meta_html}
+            <span class="h2-title">{act.activity_name}{disabled_badge}{meta_html}
               <small style="color:#bbb;font-size:.75rem;margin-left:6px">({act.activity_id})</small>
             </span>
+            <button class="{toggle_cls}" title="{toggle_title}"
+                    onclick="toggleActivity('{safe_act_id}', {str(act.enabled).lower()}, this)">
+              {toggle_label}
+            </button>
             <button class="btn-update-roster"
-                    onclick="document.getElementById('ur-input-{act.activity_id}').click()">
-              ↺ Update Roster
+                    onclick="openUpdateModal({{activity_id:'{safe_act_id}',activity_name:'{safe_act_name}',year:'{act_year}',semester:'{safe_semester}',enabled:{str(act.enabled).lower()},task_graders:'{safe_graders}'}})">
+              ↺ Update Activity
             </button>
             <input type="file" id="ur-input-{act.activity_id}"
                    accept=".csv,text/csv" style="display:none"
@@ -1455,6 +1514,10 @@ function toRFC1123Segment(str) {
     .replace(/^-+|-+$/g, '');
 }
 
+/**
+ * Auto-generate activity_id from: name – year – semester – section.
+ * Section comes from the CSV file (stored in window._rosterSection).
+ */
 function buildAutoId() {
   const name     = document.getElementById('f-activity-name').value.trim();
   const year     = document.getElementById('f-year').value.trim();
@@ -1463,8 +1526,9 @@ function buildAutoId() {
 
   if (!name || !year || !semester) return '';
 
+  // Order: name - year - semester - section  (3f / 3e)
   const rawParts = section
-    ? [name, section, year, semester]
+    ? [name, year, semester, section]
     : [name, year, semester];
 
   const parts = rawParts.map(toRFC1123Segment).filter(Boolean);
@@ -1478,13 +1542,15 @@ function buildAutoId() {
 
 function updateActivityId() {
   const idField = document.getElementById('f-activity-id');
-  if (idField.dataset.manual === 'true') return;
+  // Never overwrite when: user manually edited, OR we are in update mode (locked)
+  if (idField.dataset.manual === 'true' || idField.readOnly) return;
   const auto = buildAutoId();
   idField.value = auto;
   refreshIdBadge(auto);
 }
 
 function onActivityIdInput(input) {
+  if (input.readOnly) return;  // locked in update mode
   const pos = input.selectionStart;
   input.value = input.value.toLowerCase();
   input.setSelectionRange(pos, pos);
@@ -1502,11 +1568,69 @@ function refreshIdBadge(value) {
   badge.style.color      = ok ? '#137333' : '#c5221f';
 }
 
-// ── Add-Activity modal open / close ──────────────────────────────────
+// ── Modal open / close ───────────────────────────────────────────────
 
+/**
+ * Open in "Add" mode (new activity).
+ */
 function openModal() {
-  document.getElementById('modal-overlay').classList.add('open');
+  _openActivityModal({ mode: 'add' });
+}
+
+/**
+ * Open in "Update" mode for an existing activity.
+ * activityData = { activity_id, activity_name, year, semester, enabled, task_graders }
+ */
+function openUpdateModal(activityData) {
+  _openActivityModal({ mode: 'update', data: activityData });
+}
+
+function _openActivityModal(opts) {
+  const isUpdate = opts.mode === 'update';
+  const data     = opts.data || {};
+
   resetModal();
+
+  // Update modal title
+  document.getElementById('modal-title').textContent =
+    isUpdate ? 'Update Activity' : 'Add Activity';
+
+  if (isUpdate) {
+    // Pre-fill fields
+    document.getElementById('f-activity-name').value = data.activity_name || '';
+    document.getElementById('f-year').value           = data.year          || '';
+    const semSel = document.getElementById('f-semester');
+    Array.from(semSel.options).forEach(o => { o.selected = (o.value === data.semester); });
+    semSel.dispatchEvent(new Event('change'));   // trigger auto-ID (will be ignored due to readOnly)
+
+    // Lock the activity_id field (3g)
+    const idField = document.getElementById('f-activity-id');
+    idField.value    = data.activity_id || '';
+    idField.readOnly = true;
+    idField.style.background = '#f8f9fa';
+    idField.style.color      = '#5f6368';
+    document.getElementById('id-optional-label').style.display = 'none';
+    document.getElementById('id-locked-label').style.display   = 'inline';
+    document.getElementById('id-valid-badge').style.display    = 'none';
+
+    // Set enabled radio
+    const enabledVal = (data.enabled === true || data.enabled === 'true') ? 'true' : 'false';
+    document.querySelectorAll('input[name="f-enabled"]').forEach(r => {
+      r.checked = (r.value === enabledVal);
+    });
+
+    // Show task_graders path if set
+    if (data.task_graders) {
+      document.getElementById('grader-dir-display').textContent = data.task_graders;
+    }
+
+    // Store the activity_id being updated
+    document.getElementById('modal-overlay').dataset.activityId = data.activity_id;
+  } else {
+    document.getElementById('modal-overlay').removeAttribute('data-activity-id');
+  }
+
+  document.getElementById('modal-overlay').classList.add('open');
   document.getElementById('f-activity-name').focus();
 }
 
@@ -1528,19 +1652,33 @@ document.addEventListener('keydown', function(e) {
   el.addEventListener(evt, updateActivityId);
 });
 
-// ── Add-Activity modal helpers ────────────────────────────────────────
+// ── Modal helpers ────────────────────────────────────────────────────
 
 function resetModal() {
   document.getElementById('f-activity-name').value = '';
   document.getElementById('f-year').value           = '';
   document.getElementById('f-semester').value       = '';
+
   const idField = document.getElementById('f-activity-id');
-  idField.value          = '';
-  idField.dataset.manual = 'false';
-  document.getElementById('id-valid-badge').style.display  = 'none';
+  idField.value            = '';
+  idField.readOnly         = false;
+  idField.style.background = '';
+  idField.style.color      = '';
+  idField.dataset.manual   = 'false';
+
+  document.getElementById('id-optional-label').style.display = 'inline';
+  document.getElementById('id-locked-label').style.display   = 'none';
+  document.getElementById('id-valid-badge').style.display    = 'none';
+
+  // Reset enabled radio to "Enable" (default)
+  document.getElementById('f-enabled-yes').checked = true;
+
   document.getElementById('f-roster').value                = '';
   document.getElementById('file-name-display').textContent = 'No file chosen';
-  window._rosterSection = '';
+  document.getElementById('f-graders').value               = '';
+  document.getElementById('grader-dir-display').textContent = 'No directory chosen';
+  window._rosterSection   = '';
+  window._gradersDirName  = '';
   hideError();
   hideSuccess();
   setLoading(false);
@@ -1583,11 +1721,11 @@ function onFileChosen(input) {
   const reader = new FileReader();
   reader.onload = function(e) {
     try {
-      const text    = e.target.result;
-      const lines   = text.split(/\r?\n/).filter(l => l.trim());
+      const text     = e.target.result;
+      const lines    = text.replace(/\r/g, '').split('\n').filter(l => l.trim());
       if (lines.length < 2) { updateActivityId(); return; }
-      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-      const secIdx  = headers.findIndex(h => h.toLowerCase() === 'section');
+      const headers  = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const secIdx   = headers.findIndex(h => h.toLowerCase() === 'section');
       if (secIdx === -1) { updateActivityId(); return; }
       const firstRow = lines[1].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
       window._rosterSection = firstRow[secIdx] || '';
@@ -1599,22 +1737,36 @@ function onFileChosen(input) {
   reader.readAsText(input.files[0]);
 }
 
-// ── Add-Activity submit ───────────────────────────────────────────────
+function onGradersChosen(input) {
+  if (!input.files.length) {
+    document.getElementById('grader-dir-display').textContent = 'No directory chosen';
+    window._gradersDirName = '';
+    return;
+  }
+  // webkitRelativePath gives us "dirname/filename" – extract the top-level dir name
+  const topDir = input.files[0].webkitRelativePath.split('/')[0];
+  document.getElementById('grader-dir-display').textContent = topDir || input.files[0].name;
+  window._gradersDirName = topDir || '';
+}
 
-async function submitRoster() {
+// ── Submit (Add / Update Activity) ────────────────────────────────────
+
+async function submitActivity() {
   hideError();
   hideSuccess();
 
-  const activityName = document.getElementById('f-activity-name').value.trim();
-  const year         = document.getElementById('f-year').value.trim();
-  const semester     = document.getElementById('f-semester').value;
-  const activityId   = document.getElementById('f-activity-id').value.trim();
-  const rosterInput  = document.getElementById('f-roster');
+  const activityName  = document.getElementById('f-activity-name').value.trim();
+  const year          = document.getElementById('f-year').value.trim();
+  const semester      = document.getElementById('f-semester').value;
+  const activityId    = document.getElementById('f-activity-id').value.trim();
+  const rosterInput   = document.getElementById('f-roster');
+  const enabledRadio  = document.querySelector('input[name="f-enabled"]:checked');
+  const enabled       = enabledRadio ? enabledRadio.value === 'true' : true;
+  const isUpdate      = !!document.getElementById('modal-overlay').dataset.activityId;
 
-  if (!activityName)             { showError('Activity Name is required.'); return; }
-  if (!year)                     { showError('Year is required.'); return; }
-  if (!semester)                 { showError('Semester is required.'); return; }
-  if (!rosterInput.files.length) { showError('Please choose a roster CSV file.'); return; }
+  if (!activityName) { showError('Activity Name is required.'); return; }
+  if (!year)         { showError('Year is required.'); return; }
+  if (!semester)     { showError('Semester is required.'); return; }
 
   const yearInt = parseInt(year, 10);
   if (isNaN(yearInt) || yearInt < 2000 || yearInt > 2099) {
@@ -1622,59 +1774,139 @@ async function submitRoster() {
     return;
   }
 
-  if (activityId && !RFC1123_RE.test(activityId)) {
+  // Activity ID validation only on create (it's locked on update)
+  if (!isUpdate && activityId && !RFC1123_RE.test(activityId)) {
     showError(
-      'Activity ID has an invalid format.\n' +
-      'Use only lowercase letters, digits, hyphens (-) and dots (.).\n' +
-      'Must start and end with a letter or digit.\n' +
-      'Example: intro-to-ai-11637-b-2024-fall'
+      'Activity ID has an invalid format.\\n' +
+      'Use only lowercase letters, digits, hyphens (-) and dots (.).\\n' +
+      'Must start and end with a letter or digit.\\n' +
+      'Example: intro-to-ai-2026-fall-11637-b'
     );
     return;
   }
 
   setLoading(true);
 
-  const fd = new FormData();
-  fd.append('activity_name',    activityName);
-  fd.append('year',             String(yearInt));
-  fd.append('semester',         semester);
-  fd.append('instructor_email', INSTRUCTOR_EMAIL);
-  fd.append('roster',           rosterInput.files[0]);
-  if (activityId) fd.append('activity_id', activityId);
+  // ── If a roster is present, use the roster endpoint ──────────────
+  if (rosterInput.files.length) {
+    const fd = new FormData();
+    fd.append('activity_name',    activityName);
+    fd.append('year',             String(yearInt));
+    fd.append('semester',         semester);
+    fd.append('instructor_email', INSTRUCTOR_EMAIL);
+    fd.append('roster',           rosterInput.files[0]);
+    if (activityId && !isUpdate) fd.append('activity_id', activityId);
 
-  try {
-    const resp = await fetch('/api/activity/roster', {
-      method:  'POST',
-      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
-      body:    fd,
-    });
-
-    const data = await resp.json().catch(() => ({}));
-
-    if (!resp.ok) {
-      showError(typeof data.detail === 'string'
-        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
+    try {
+      const resp = await fetch('/api/activity/roster', {
+        method:  'POST',
+        headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+        body:    fd,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showError(typeof data.detail === 'string'
+          ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
+        setLoading(false);
+        return;
+      }
+      // After roster upload, also patch enabled + activity_name + task_graders
+      const resolvedId = data.activity_id;
+      await _patchActivityMeta(resolvedId, activityName, enabled);
+      const label = data.is_new_activity ? 'created' : 'updated';
+      showSuccess('Activity "' + data.activity_name + '" ' + label + ' \u00b7 '
+        + data.enrolled_count + ' enrolled, ' + data.skipped_count + ' updated.');
+    } catch (err) {
+      showError('Network error: ' + err.message);
       setLoading(false);
       return;
     }
+  } else {
+    // ── No roster: create/update the activity record directly ────────
+    const fd = new FormData();
+    fd.append('activity_name', activityName);
+    fd.append('year',          String(yearInt));
+    fd.append('semester',      semester);
+    fd.append('enabled',       String(enabled));
+    if (activityId && !isUpdate) fd.append('activity_id', activityId);
+    if (isUpdate) {
+      const existingId = document.getElementById('modal-overlay').dataset.activityId;
+      fd.append('activity_id', existingId);
+    }
 
-    const label = data.is_new_activity ? 'created' : 'updated';
-    showSuccess(
-      'Activity "' + data.activity_name + '" ' + label + ' \u00b7 ' +
-      data.enrolled_count + ' enrolled, ' + data.skipped_count + ' updated.'
-    );
-    setTimeout(async () => {
-      closeModal();
-      await refreshActivities();
-    }, 1200);
+    try {
+      const resp = await fetch('/api/activity', {
+        method:  'POST',
+        headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+        body:    fd,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showError(typeof data.detail === 'string'
+          ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
+        setLoading(false);
+        return;
+      }
+      showSuccess('Activity "' + activityName + '" ' + (isUpdate ? 'updated' : 'created') + '.');
+    } catch (err) {
+      showError('Network error: ' + err.message);
+      setLoading(false);
+      return;
+    }
+  }
+
+  setTimeout(async () => {
+    closeModal();
+    await refreshActivities();
+  }, 1200);
+}
+
+/** PATCH activity_name + enabled (and optionally task_graders) on an existing activity. */
+async function _patchActivityMeta(activityId, activityName, enabled) {
+  const fd = new FormData();
+  fd.append('activity_id',   activityId);
+  fd.append('activity_name', activityName);
+  fd.append('enabled',       String(enabled));
+  if (window._gradersDirName) fd.append('task_graders', window._gradersDirName);
+  await fetch('/api/activity', {
+    method:  'POST',
+    headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+    body:    fd,
+  });
+}
+
+// ── Enable/Disable toggle (per-card) ─────────────────────────────────
+
+async function toggleActivity(activityId, currentEnabled, btn) {
+  const newEnabled = !currentEnabled;
+  btn.disabled = true;
+
+  try {
+    const resp = await fetch('/api/activity/' + encodeURIComponent(activityId) + '/enabled', {
+      method:  'PATCH',
+      headers: {
+        'Authorization': 'Bearer ' + BEARER_TOKEN,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({ enabled: newEnabled }),
+    });
+
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      alert('Toggle failed: ' + (data.detail || 'Server error ' + resp.status));
+      btn.disabled = false;
+      return;
+    }
+
+    await refreshActivities();
 
   } catch (err) {
-    showError('Network error: ' + err.message);
-    setLoading(false);
+    alert('Network error: ' + err.message);
+    btn.disabled = false;
   }
 }
 
-// ── Update Roster (per-card file input) ──────────────────────────────
+// ── Update Roster / Activity (per-card file input) ────────────────────
 
 async function onUpdateRosterChosen(input, activityId) {
   if (!input.files.length) return;
@@ -1701,7 +1933,7 @@ async function onUpdateRosterChosen(input, activityId) {
     if (!resp.ok) {
       const msg = typeof data.detail === 'string'
         ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status);
-      alert('Update Roster failed:\n\n' + msg);
+      alert('Update Activity failed:\\n\\n' + msg);
       btn.textContent = origLabel;
       btn.disabled    = false;
       input.value     = '';
@@ -1873,7 +2105,7 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
 </div>
 
 <!-- ═══════════════════════════════════════════
-     Add-Activity modal
+     Add / Update Activity modal
 ════════════════════════════════════════════ -->
 <div class="modal-overlay" id="modal-overlay" role="dialog"
      aria-modal="true" aria-labelledby="modal-title">
@@ -1919,10 +2151,11 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
                style="background:#f8f9fa;color:#555">
       </div>
 
-      <!-- Activity ID (optional, auto-generated, RFC 1123 subdomain) -->
+      <!-- Activity ID (optional on create, locked on update) -->
       <div class="field">
         <label for="f-activity-id">Activity ID
-          <span style="color:#888;font-weight:400">(optional)</span>
+          <span id="id-optional-label" style="color:#888;font-weight:400">(optional)</span>
+          <span id="id-locked-label"   style="color:#888;font-weight:400;display:none">(locked — cannot change after creation)</span>
           <span id="id-valid-badge" style="display:none;margin-left:8px;font-size:.78rem;
                 font-weight:600;padding:1px 7px;border-radius:10px"></span>
         </label>
@@ -1930,17 +2163,33 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
                placeholder="Auto-generated from fields above"
                oninput="onActivityIdInput(this)">
         <div class="hint">
-          Auto-generated from Activity Name + Section + Year + Semester.
-          You may edit it manually. Must follow RFC&nbsp;1123 subdomain format:
+          Auto-generated from Activity Name + Year + Semester + Section.
+          You may edit it manually, but only during activity creation.
+          The Activity ID must follow RFC&nbsp;1123 subdomain format:
           lowercase letters, digits, <code>-</code>, and <code>.</code> only;
           must start and end with a letter or digit
-          (e.g.&nbsp;<code>intro-to-ai-11637-b-2024-fall</code>).
+          (e.g.&nbsp;<code>intro-to-ai-2026-fall-11637-b</code>).
         </div>
       </div>
 
-      <!-- Roster file -->
+      <!-- Enable / Disable radio -->
       <div class="field">
-        <label>Roster CSV <span class="req">*</span></label>
+        <label>Status <span class="req">*</span></label>
+        <div style="display:flex;gap:20px;margin-top:4px">
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="radio" name="f-enabled" id="f-enabled-yes" value="true" checked>
+            Enable
+          </label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="radio" name="f-enabled" id="f-enabled-no" value="false">
+            Disable
+          </label>
+        </div>
+      </div>
+
+      <!-- Roster file (optional) -->
+      <div class="field">
+        <label>Roster CSV <span style="color:#888;font-weight:400">(optional)</span></label>
         <div class="file-row">
           <button class="btn-browse" type="button" onclick="document.getElementById('f-roster').click()">
             Add Roster
@@ -1954,12 +2203,31 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
           All rows must share a single Section value.
         </div>
       </div>
+
+      <!-- Graders directory (optional) -->
+      <div class="field">
+        <label>Graders Directory <span style="color:#888;font-weight:400">(optional)</span></label>
+        <div class="file-row">
+          <button class="btn-browse" type="button"
+                  onclick="document.getElementById('f-graders').click()">
+            Add Graders
+          </button>
+          <input type="file" id="f-graders" webkitdirectory mozdirectory
+                 onchange="onGradersChosen(this)" style="display:none">
+          <span class="file-name" id="grader-dir-display">No directory chosen</span>
+        </div>
+        <div class="hint">
+          Select the directory containing per-task grader scripts
+          (<code>grade_task1.py</code>, <code>grade_task2.py</code>, …).
+          Updates the <code>task_graders</code> field.
+        </div>
+      </div>
     </div><!-- /modal-body -->
 
     <div class="modal-footer">
       <div class="spinner" id="spinner"></div>
       <button class="btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn-primary"   id="submit-btn" onclick="submitRoster()">Upload Roster</button>
+      <button class="btn-primary"   id="submit-btn" onclick="submitActivity()">Submit</button>
     </div>
 
   </div><!-- /modal -->
