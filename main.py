@@ -24,6 +24,7 @@ GET    /api/activities                  – list activities
 
 POST   /api/activity/roster             – upload a CSV roster to create/update an activity and enroll users
 POST   /api/activity/roster/update      – update enrollment for an existing activity from a new CSV roster
+POST   /api/activity/{activity_id}/graders  – set the task_graders directory path for an activity
 
 POST   /api/instructor                  – add instructor / assign activity
 
@@ -425,6 +426,37 @@ async def toggle_activity_enabled(
     activity.enabled = bool(body.get("enabled", not activity.enabled))
     db.commit()
     return {"status": "ok", "activity_id": activity_id, "enabled": activity.enabled}
+
+
+@app.post("/api/activity/{activity_id}/graders")
+async def set_activity_graders(
+    activity_id: str,
+    task_graders: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Set the task_graders directory path for an activity.
+
+    Does not require an instructor token — intended for server-side or
+    deployment scripts that configure grading after the activity is created.
+
+    Body (form):
+        task_graders  – absolute or relative path to the directory containing
+                        per-task grader scripts (grade_task1.py, grade_task2.py, …)
+    """
+    activity = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    activity.task_graders = task_graders
+    db.commit()
+    return {
+        "status":       "ok",
+        "activity_id":  activity_id,
+        "task_graders": activity.task_graders,
+    }
 
 
 @app.get("/api/activities")
@@ -1451,7 +1483,6 @@ def _build_activity_cards(instructor, db) -> str:
         # Build JS object of activity data for the update modal
         safe_act_name = act.activity_name.replace("'", "\\'").replace("\\", "\\\\")
         safe_semester = (act.semester or "").replace("'", "\\'")
-        safe_graders  = (act.task_graders or "").replace("'", "\\'").replace("\\", "\\\\")
         act_year      = act.year or ""
 
         cards += f"""
@@ -1465,7 +1496,7 @@ def _build_activity_cards(instructor, db) -> str:
               {toggle_label}
             </button>
             <button class="btn-update-roster"
-                    onclick="openUpdateModal({{activity_id:'{safe_act_id}',activity_name:'{safe_act_name}',year:'{act_year}',semester:'{safe_semester}',enabled:{str(act.enabled).lower()},task_graders:'{safe_graders}'}})">
+                    onclick="openUpdateModal({{activity_id:'{safe_act_id}',activity_name:'{safe_act_name}',year:'{act_year}',semester:'{safe_semester}',enabled:{str(act.enabled).lower()}}})">
               ↺ Update Activity
             </button>
             <input type="file" id="ur-input-{act.activity_id}"
@@ -1579,7 +1610,7 @@ function openModal() {
 
 /**
  * Open in "Update" mode for an existing activity.
- * activityData = { activity_id, activity_name, year, semester, enabled, task_graders }
+ * activityData = { activity_id, activity_name, year, semester, enabled }
  */
 function openUpdateModal(activityData) {
   _openActivityModal({ mode: 'update', data: activityData });
@@ -1619,10 +1650,6 @@ function _openActivityModal(opts) {
       r.checked = (r.value === enabledVal);
     });
 
-    // Show task_graders path if set
-    if (data.task_graders) {
-      document.getElementById('grader-dir-display').textContent = data.task_graders;
-    }
 
     // Store the activity_id being updated
     document.getElementById('modal-overlay').dataset.activityId = data.activity_id;
@@ -1675,10 +1702,7 @@ function resetModal() {
 
   document.getElementById('f-roster').value                = '';
   document.getElementById('file-name-display').textContent = 'No file chosen';
-  document.getElementById('f-graders').value               = '';
-  document.getElementById('grader-dir-display').textContent = 'No directory chosen';
   window._rosterSection   = '';
-  window._gradersDirName  = '';
   hideError();
   hideSuccess();
   setLoading(false);
@@ -1737,17 +1761,6 @@ function onFileChosen(input) {
   reader.readAsText(input.files[0]);
 }
 
-function onGradersChosen(input) {
-  if (!input.files.length) {
-    document.getElementById('grader-dir-display').textContent = 'No directory chosen';
-    window._gradersDirName = '';
-    return;
-  }
-  // webkitRelativePath gives us "dirname/filename" – extract the top-level dir name
-  const topDir = input.files[0].webkitRelativePath.split('/')[0];
-  document.getElementById('grader-dir-display').textContent = topDir || input.files[0].name;
-  window._gradersDirName = topDir || '';
-}
 
 // ── Submit (Add / Update Activity) ────────────────────────────────────
 
@@ -1810,7 +1823,7 @@ async function submitActivity() {
         setLoading(false);
         return;
       }
-      // After roster upload, also patch enabled + activity_name + task_graders
+      // After roster upload, also patch enabled + activity_name
       const resolvedId = data.activity_id;
       await _patchActivityMeta(resolvedId, activityName, enabled);
       const label = data.is_new_activity ? 'created' : 'updated';
@@ -1861,13 +1874,12 @@ async function submitActivity() {
   }, 1200);
 }
 
-/** PATCH activity_name + enabled (and optionally task_graders) on an existing activity. */
+/** PATCH activity_name + enabled on an existing activity. */
 async function _patchActivityMeta(activityId, activityName, enabled) {
   const fd = new FormData();
   fd.append('activity_id',   activityId);
   fd.append('activity_name', activityName);
   fd.append('enabled',       String(enabled));
-  if (window._gradersDirName) fd.append('task_graders', window._gradersDirName);
   await fetch('/api/activity', {
     method:  'POST',
     headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
@@ -2204,24 +2216,6 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
         </div>
       </div>
 
-      <!-- Graders directory (optional) -->
-      <div class="field">
-        <label>Graders Directory <span style="color:#888;font-weight:400">(optional)</span></label>
-        <div class="file-row">
-          <button class="btn-browse" type="button"
-                  onclick="document.getElementById('f-graders').click()">
-            Add Graders
-          </button>
-          <input type="file" id="f-graders" webkitdirectory mozdirectory
-                 onchange="onGradersChosen(this)" style="display:none">
-          <span class="file-name" id="grader-dir-display">No directory chosen</span>
-        </div>
-        <div class="hint">
-          Select the directory containing per-task grader scripts
-          (<code>grade_task1.py</code>, <code>grade_task2.py</code>, …).
-          Updates the <code>task_graders</code> field.
-        </div>
-      </div>
     </div><!-- /modal-body -->
 
     <div class="modal-footer">
