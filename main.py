@@ -1432,6 +1432,380 @@ def _build_activity_cards(instructor, db) -> str:
     return cards or "<p style='color:#888'>No activities assigned yet.</p>"
 
 
+# Pre-built JS block for the instructor dashboard.
+# Kept outside the f-string to avoid Python escaping issues with
+# backslashes in the RFC 1123 regex.  Token/email are injected at
+# runtime via str.replace() on the two placeholder strings.
+_DASHBOARD_JS = r"""// ── Globals ──────────────────────────────────────────────────────────
+const BEARER_TOKEN     = `__BEARER_TOKEN__`;
+const INSTRUCTOR_EMAIL = `__INSTRUCTOR_EMAIL__`;
+
+// RFC 1123 subdomain validation.
+const RFC1123_RE = new RegExp(
+  '^[a-z0-9]([-a-z0-9]*[a-z0-9])?' +
+  '(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+);
+
+// ── RFC 1123 slug helpers ────────────────────────────────────────────
+
+function toRFC1123Segment(str) {
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function buildAutoId() {
+  const name     = document.getElementById('f-activity-name').value.trim();
+  const year     = document.getElementById('f-year').value.trim();
+  const semester = document.getElementById('f-semester').value;
+  const section  = window._rosterSection || '';
+
+  if (!name || !year || !semester) return '';
+
+  const rawParts = section
+    ? [name, section, year, semester]
+    : [name, year, semester];
+
+  const parts = rawParts.map(toRFC1123Segment).filter(Boolean);
+  if (parts.length < (section ? 4 : 3)) return '';
+
+  const candidate = parts.join('-');
+  return RFC1123_RE.test(candidate) ? candidate : '';
+}
+
+// ── Activity-ID live update & validation ─────────────────────────────
+
+function updateActivityId() {
+  const idField = document.getElementById('f-activity-id');
+  if (idField.dataset.manual === 'true') return;
+  const auto = buildAutoId();
+  idField.value = auto;
+  refreshIdBadge(auto);
+}
+
+function onActivityIdInput(input) {
+  const pos = input.selectionStart;
+  input.value = input.value.toLowerCase();
+  input.setSelectionRange(pos, pos);
+  input.dataset.manual = input.value !== '' ? 'true' : 'false';
+  refreshIdBadge(input.value);
+}
+
+function refreshIdBadge(value) {
+  const badge = document.getElementById('id-valid-badge');
+  if (!value) { badge.style.display = 'none'; return; }
+  const ok = RFC1123_RE.test(value);
+  badge.style.display    = 'inline';
+  badge.textContent      = ok ? '\u2713 valid' : '\u2717 invalid format';
+  badge.style.background = ok ? '#e6f4ea' : '#fce8e6';
+  badge.style.color      = ok ? '#137333' : '#c5221f';
+}
+
+// ── Add-Activity modal open / close ──────────────────────────────────
+
+function openModal() {
+  document.getElementById('modal-overlay').classList.add('open');
+  resetModal();
+  document.getElementById('f-activity-name').focus();
+}
+
+function closeModal() {
+  document.getElementById('modal-overlay').classList.remove('open');
+}
+
+document.getElementById('modal-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') { closeModal(); closeDeleteConfirm(); }
+});
+
+['f-activity-name', 'f-year', 'f-semester'].forEach(function(id) {
+  const el  = document.getElementById(id);
+  const evt = (el.tagName === 'SELECT') ? 'change' : 'input';
+  el.addEventListener(evt, updateActivityId);
+});
+
+// ── Add-Activity modal helpers ────────────────────────────────────────
+
+function resetModal() {
+  document.getElementById('f-activity-name').value = '';
+  document.getElementById('f-year').value           = '';
+  document.getElementById('f-semester').value       = '';
+  const idField = document.getElementById('f-activity-id');
+  idField.value          = '';
+  idField.dataset.manual = 'false';
+  document.getElementById('id-valid-badge').style.display  = 'none';
+  document.getElementById('f-roster').value                = '';
+  document.getElementById('file-name-display').textContent = 'No file chosen';
+  window._rosterSection = '';
+  hideError();
+  hideSuccess();
+  setLoading(false);
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = msg;
+  el.classList.add('visible');
+  document.getElementById('success-banner').classList.remove('visible');
+}
+
+function hideError() {
+  document.getElementById('error-banner').classList.remove('visible');
+}
+
+function showSuccess(msg) {
+  const el = document.getElementById('success-banner');
+  el.textContent = msg;
+  el.classList.add('visible');
+  document.getElementById('error-banner').classList.remove('visible');
+}
+
+function hideSuccess() {
+  document.getElementById('success-banner').classList.remove('visible');
+}
+
+function setLoading(on) {
+  document.getElementById('spinner').style.display  = on ? 'block' : 'none';
+  document.getElementById('submit-btn').disabled    = on;
+}
+
+function onFileChosen(input) {
+  document.getElementById('file-name-display').textContent =
+    input.files.length ? input.files[0].name : 'No file chosen';
+
+  window._rosterSection = '';
+  if (!input.files.length) { updateActivityId(); return; }
+
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    try {
+      const text    = e.target.result;
+      const lines   = text.split(/\r?\n/).filter(l => l.trim());
+      if (lines.length < 2) { updateActivityId(); return; }
+      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const secIdx  = headers.findIndex(h => h.toLowerCase() === 'section');
+      if (secIdx === -1) { updateActivityId(); return; }
+      const firstRow = lines[1].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
+      window._rosterSection = firstRow[secIdx] || '';
+    } catch (_) {
+      window._rosterSection = '';
+    }
+    updateActivityId();
+  };
+  reader.readAsText(input.files[0]);
+}
+
+// ── Add-Activity submit ───────────────────────────────────────────────
+
+async function submitRoster() {
+  hideError();
+  hideSuccess();
+
+  const activityName = document.getElementById('f-activity-name').value.trim();
+  const year         = document.getElementById('f-year').value.trim();
+  const semester     = document.getElementById('f-semester').value;
+  const activityId   = document.getElementById('f-activity-id').value.trim();
+  const rosterInput  = document.getElementById('f-roster');
+
+  if (!activityName)             { showError('Activity Name is required.'); return; }
+  if (!year)                     { showError('Year is required.'); return; }
+  if (!semester)                 { showError('Semester is required.'); return; }
+  if (!rosterInput.files.length) { showError('Please choose a roster CSV file.'); return; }
+
+  const yearInt = parseInt(year, 10);
+  if (isNaN(yearInt) || yearInt < 2000 || yearInt > 2099) {
+    showError('Year must be a 4-digit number between 2000 and 2099.');
+    return;
+  }
+
+  if (activityId && !RFC1123_RE.test(activityId)) {
+    showError(
+      'Activity ID has an invalid format.\n' +
+      'Use only lowercase letters, digits, hyphens (-) and dots (.).\n' +
+      'Must start and end with a letter or digit.\n' +
+      'Example: intro-to-ai-11637-b-2024-fall'
+    );
+    return;
+  }
+
+  setLoading(true);
+
+  const fd = new FormData();
+  fd.append('activity_name',    activityName);
+  fd.append('year',             String(yearInt));
+  fd.append('semester',         semester);
+  fd.append('instructor_email', INSTRUCTOR_EMAIL);
+  fd.append('roster',           rosterInput.files[0]);
+  if (activityId) fd.append('activity_id', activityId);
+
+  try {
+    const resp = await fetch('/api/activity/roster', {
+      method:  'POST',
+      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+      body:    fd,
+    });
+
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      showError(typeof data.detail === 'string'
+        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
+      setLoading(false);
+      return;
+    }
+
+    const label = data.is_new_activity ? 'created' : 'updated';
+    showSuccess(
+      'Activity "' + data.activity_name + '" ' + label + ' \u00b7 ' +
+      data.enrolled_count + ' enrolled, ' + data.skipped_count + ' updated.'
+    );
+    setTimeout(async () => {
+      closeModal();
+      await refreshActivities();
+    }, 1200);
+
+  } catch (err) {
+    showError('Network error: ' + err.message);
+    setLoading(false);
+  }
+}
+
+// ── Update Roster (per-card file input) ──────────────────────────────
+
+async function onUpdateRosterChosen(input, activityId) {
+  if (!input.files.length) return;
+  const file = input.files[0];
+
+  const btn = input.previousElementSibling;
+  const origLabel = btn.textContent;
+  btn.textContent = '\u23f3 Uploading\u2026';
+  btn.disabled    = true;
+
+  const fd = new FormData();
+  fd.append('activity_id', activityId);
+  fd.append('roster',      file);
+
+  try {
+    const resp = await fetch('/api/activity/roster/update', {
+      method:  'POST',
+      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+      body:    fd,
+    });
+
+    const data = await resp.json().catch(() => ({}));
+
+    if (!resp.ok) {
+      const msg = typeof data.detail === 'string'
+        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status);
+      alert('Update Roster failed:\n\n' + msg);
+      btn.textContent = origLabel;
+      btn.disabled    = false;
+      input.value     = '';
+      return;
+    }
+
+    await refreshActivities();
+
+  } catch (err) {
+    alert('Network error: ' + err.message);
+    btn.textContent = origLabel;
+    btn.disabled    = false;
+    input.value     = '';
+  }
+}
+
+// ── Refresh activity cards ────────────────────────────────────────────
+
+async function refreshActivities() {
+  try {
+    const resp = await fetch('/api/dashboard-cards', {
+      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+    });
+    if (resp.ok) {
+      document.getElementById('activity-container').innerHTML = await resp.text();
+    } else {
+      window.location.reload();
+    }
+  } catch (_) {
+    window.location.reload();
+  }
+}
+
+// ── Delete-confirm dialog ─────────────────────────────────────────────
+
+let _pendingDeleteId = null;
+
+function openDeleteConfirm(activityId) {
+  _pendingDeleteId = activityId;
+  document.getElementById('del-body').innerHTML =
+    'Are you sure you want to delete activity <code>' + activityId + '</code>?' +
+    '<br><br>All activity records, including submissions, will be deleted as well.';
+  document.getElementById('btn-confirm-delete').disabled = false;
+  document.getElementById('btn-no-delete').disabled      = false;
+  document.getElementById('del-spinner').style.display   = 'none';
+  document.getElementById('delete-overlay').classList.add('open');
+  setTimeout(() => document.getElementById('btn-no-delete').focus(), 50);
+}
+
+function closeDeleteConfirm() {
+  document.getElementById('delete-overlay').classList.remove('open');
+  _pendingDeleteId = null;
+}
+
+document.getElementById('delete-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeDeleteConfirm();
+});
+
+async function confirmDelete() {
+  if (!_pendingDeleteId) return;
+  const activityId = _pendingDeleteId;
+
+  document.getElementById('btn-confirm-delete').disabled = true;
+  document.getElementById('btn-no-delete').disabled      = true;
+  document.getElementById('del-spinner').style.display   = 'block';
+
+  try {
+    const resp = await fetch('/api/activity/' + encodeURIComponent(activityId), {
+      method:  'DELETE',
+      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+    });
+
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      document.getElementById('del-body').innerHTML +=
+        '<br><br><span style="color:#a50e0e;font-weight:600">Error: ' +
+        (data.detail || 'Server error ' + resp.status) + '</span>';
+      document.getElementById('btn-confirm-delete').disabled = false;
+      document.getElementById('btn-no-delete').disabled      = false;
+      document.getElementById('del-spinner').style.display   = 'none';
+      return;
+    }
+
+    closeDeleteConfirm();
+    await refreshActivities();
+
+  } catch (err) {
+    document.getElementById('del-body').innerHTML +=
+      '<br><br><span style="color:#a50e0e;font-weight:600">Network error: ' + err.message + '</span>';
+    document.getElementById('btn-confirm-delete').disabled = false;
+    document.getElementById('btn-no-delete').disabled      = false;
+    document.getElementById('del-spinner').style.display   = 'none';
+  }
+}"""
+
+
+def _build_dashboard_script(safe_token: str, safe_email: str) -> str:
+    """Return the full <script>…</script> block with token/email injected."""
+    js = _DASHBOARD_JS
+    js = js.replace('__BEARER_TOKEN__',     safe_token)
+    js = js.replace('__INSTRUCTOR_EMAIL__', safe_email)
+    return '<script>\n' + js + '\n</script>'
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, token: str = None, db: Session = Depends(get_db)):
     # ── Auth ──────────────────────────────────────────────────────────
@@ -1617,373 +1991,7 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
   </div>
 </div>
 
-<script>
-// ── Globals ──────────────────────────────────────────────────────────
-const BEARER_TOKEN     = `{{safe_token}}`;
-const INSTRUCTOR_EMAIL = `{{safe_email}}`;
-
-// RFC 1123 subdomain validation.
-// Written as new RegExp(...) to avoid Python f-string backslash conflicts
-// with JS regex literal syntax.
-const RFC1123_RE = new RegExp(
-  '^[a-z0-9]([-a-z0-9]*[a-z0-9])?' +
-  '(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
-);
-
-// ── RFC 1123 slug helpers ────────────────────────────────────────────
-
-function toRFC1123Segment(str) {{
-  return str
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-}}
-
-function buildAutoId() {{
-  const name     = document.getElementById('f-activity-name').value.trim();
-  const year     = document.getElementById('f-year').value.trim();
-  const semester = document.getElementById('f-semester').value;
-  const section  = window._rosterSection || '';
-
-  if (!name || !year || !semester) return '';
-
-  const rawParts = section
-    ? [name, section, year, semester]
-    : [name, year, semester];
-
-  const parts = rawParts.map(toRFC1123Segment).filter(Boolean);
-  if (parts.length < (section ? 4 : 3)) return '';
-
-  const candidate = parts.join('-');
-  return RFC1123_RE.test(candidate) ? candidate : '';
-}}
-
-// ── Activity-ID live update & validation ─────────────────────────────
-
-function updateActivityId() {{
-  const idField = document.getElementById('f-activity-id');
-  if (idField.dataset.manual === 'true') return;
-  const auto = buildAutoId();
-  idField.value = auto;
-  refreshIdBadge(auto);
-}}
-
-function onActivityIdInput(input) {{
-  const pos = input.selectionStart;
-  input.value = input.value.toLowerCase();
-  input.setSelectionRange(pos, pos);
-  input.dataset.manual = input.value !== '' ? 'true' : 'false';
-  refreshIdBadge(input.value);
-}}
-
-function refreshIdBadge(value) {{
-  const badge = document.getElementById('id-valid-badge');
-  if (!value) {{ badge.style.display = 'none'; return; }}
-  const ok = RFC1123_RE.test(value);
-  badge.style.display    = 'inline';
-  badge.textContent      = ok ? '✓ valid' : '✗ invalid format';
-  badge.style.background = ok ? '#e6f4ea' : '#fce8e6';
-  badge.style.color      = ok ? '#137333' : '#c5221f';
-}}
-
-// ── Add-Activity modal open / close ──────────────────────────────────
-
-function openModal() {{
-  document.getElementById('modal-overlay').classList.add('open');
-  resetModal();
-  document.getElementById('f-activity-name').focus();
-}}
-
-function closeModal() {{
-  document.getElementById('modal-overlay').classList.remove('open');
-}}
-
-document.getElementById('modal-overlay').addEventListener('click', function(e) {{
-  if (e.target === this) closeModal();
-}});
-
-document.addEventListener('keydown', function(e) {{
-  if (e.key === 'Escape') {{
-    closeModal();
-    closeDeleteConfirm();
-  }}
-}});
-
-['f-activity-name', 'f-year', 'f-semester'].forEach(function(id) {{
-  const el  = document.getElementById(id);
-  const evt = (el.tagName === 'SELECT') ? 'change' : 'input';
-  el.addEventListener(evt, updateActivityId);
-}});
-
-// ── Add-Activity modal helpers ────────────────────────────────────────
-
-function resetModal() {{
-  document.getElementById('f-activity-name').value = '';
-  document.getElementById('f-year').value           = '';
-  document.getElementById('f-semester').value       = '';
-  const idField = document.getElementById('f-activity-id');
-  idField.value          = '';
-  idField.dataset.manual = 'false';
-  document.getElementById('id-valid-badge').style.display  = 'none';
-  document.getElementById('f-roster').value                = '';
-  document.getElementById('file-name-display').textContent = 'No file chosen';
-  window._rosterSection = '';
-  hideError();
-  hideSuccess();
-  setLoading(false);
-}}
-
-function showError(msg) {{
-  const el = document.getElementById('error-banner');
-  el.textContent = msg;
-  el.classList.add('visible');
-  document.getElementById('success-banner').classList.remove('visible');
-}}
-
-function hideError() {{
-  document.getElementById('error-banner').classList.remove('visible');
-}}
-
-function showSuccess(msg) {{
-  const el = document.getElementById('success-banner');
-  el.textContent = msg;
-  el.classList.add('visible');
-  document.getElementById('error-banner').classList.remove('visible');
-}}
-
-function hideSuccess() {{
-  document.getElementById('success-banner').classList.remove('visible');
-}}
-
-function setLoading(on) {{
-  document.getElementById('spinner').style.display  = on ? 'block' : 'none';
-  document.getElementById('submit-btn').disabled    = on;
-}}
-
-function onFileChosen(input) {{
-  document.getElementById('file-name-display').textContent =
-    input.files.length ? input.files[0].name : 'No file chosen';
-
-  window._rosterSection = '';
-  if (!input.files.length) {{ updateActivityId(); return; }}
-
-  const reader = new FileReader();
-  reader.onload = function(e) {{
-    try {{
-      const text    = e.target.result;
-      const lines   = text.split(/\r?\n/).filter(l => l.trim());
-      if (lines.length < 2) {{ updateActivityId(); return; }}
-      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-      const secIdx  = headers.findIndex(h => h.toLowerCase() === 'section');
-      if (secIdx === -1) {{ updateActivityId(); return; }}
-      const firstRow = lines[1].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
-      window._rosterSection = firstRow[secIdx] || '';
-    }} catch (_) {{
-      window._rosterSection = '';
-    }}
-    updateActivityId();
-  }};
-  reader.readAsText(input.files[0]);
-}}
-
-// ── Add-Activity submit ───────────────────────────────────────────────
-
-async function submitRoster() {{
-  hideError();
-  hideSuccess();
-
-  const activityName = document.getElementById('f-activity-name').value.trim();
-  const year         = document.getElementById('f-year').value.trim();
-  const semester     = document.getElementById('f-semester').value;
-  const activityId   = document.getElementById('f-activity-id').value.trim();
-  const rosterInput  = document.getElementById('f-roster');
-
-  if (!activityName)             {{ showError('Activity Name is required.'); return; }}
-  if (!year)                     {{ showError('Year is required.'); return; }}
-  if (!semester)                 {{ showError('Semester is required.'); return; }}
-  if (!rosterInput.files.length) {{ showError('Please choose a roster CSV file.'); return; }}
-
-  const yearInt = parseInt(year, 10);
-  if (isNaN(yearInt) || yearInt < 2000 || yearInt > 2099) {{
-    showError('Year must be a 4-digit number between 2000 and 2099.');
-    return;
-  }}
-
-  if (activityId && !RFC1123_RE.test(activityId)) {{
-    showError(
-      'Activity ID has an invalid format.\n' +
-      'Use only lowercase letters, digits, hyphens (-) and dots (.).\n' +
-      'Must start and end with a letter or digit.\n' +
-      'Example: intro-to-ai-11637-b-2024-fall'
-    );
-    return;
-  }}
-
-  setLoading(true);
-
-  const fd = new FormData();
-  fd.append('activity_name',    activityName);
-  fd.append('year',             String(yearInt));
-  fd.append('semester',         semester);
-  fd.append('instructor_email', INSTRUCTOR_EMAIL);
-  fd.append('roster',           rosterInput.files[0]);
-  if (activityId) fd.append('activity_id', activityId);
-
-  try {{
-    const resp = await fetch('/api/activity/roster', {{
-      method:  'POST',
-      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
-      body:    fd,
-    }});
-
-    const data = await resp.json().catch(() => ({{}}));
-
-    if (!resp.ok) {{
-      showError(typeof data.detail === 'string'
-        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
-      setLoading(false);
-      return;
-    }}
-
-    const label = data.is_new_activity ? 'created' : 'updated';
-    showSuccess(
-      'Activity "' + data.activity_name + '" ' + label + ' · ' +
-      data.enrolled_count + ' enrolled, ' + data.skipped_count + ' updated.'
-    );
-    setTimeout(async () => {{
-      closeModal();
-      await refreshActivities();
-    }}, 1200);
-
-  }} catch (err) {{
-    showError('Network error: ' + err.message);
-    setLoading(false);
-  }}
-}}
-
-// ── Update Roster (per-card file input) ──────────────────────────────
-
-async function onUpdateRosterChosen(input, activityId) {{
-  if (!input.files.length) return;
-  const file = input.files[0];
-
-  const btn = input.previousElementSibling;
-  const origLabel = btn.textContent;
-  btn.textContent = '⏳ Uploading…';
-  btn.disabled    = true;
-
-  const fd = new FormData();
-  fd.append('activity_id', activityId);
-  fd.append('roster',      file);
-
-  try {{
-    const resp = await fetch('/api/activity/roster/update', {{
-      method:  'POST',
-      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
-      body:    fd,
-    }});
-
-    const data = await resp.json().catch(() => ({{}}));
-
-    if (!resp.ok) {{
-      const msg = typeof data.detail === 'string'
-        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status);
-      alert('Update Roster failed:\n\n' + msg);
-      btn.textContent = origLabel;
-      btn.disabled    = false;
-      input.value     = '';
-      return;
-    }}
-
-    await refreshActivities();
-
-  }} catch (err) {{
-    alert('Network error: ' + err.message);
-    btn.textContent = origLabel;
-    btn.disabled    = false;
-    input.value     = '';
-  }}
-}}
-
-// ── Refresh activity cards ────────────────────────────────────────────
-
-async function refreshActivities() {{
-  try {{
-    const resp = await fetch('/api/dashboard-cards', {{
-      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
-    }});
-    if (resp.ok) {{
-      document.getElementById('activity-container').innerHTML = await resp.text();
-    }} else {{
-      window.location.reload();
-    }}
-  }} catch (_) {{
-    window.location.reload();
-  }}
-}}
-
-// ── Delete-confirm dialog ─────────────────────────────────────────────
-
-let _pendingDeleteId = null;
-
-function openDeleteConfirm(activityId) {{
-  _pendingDeleteId = activityId;
-  document.getElementById('del-body').innerHTML =
-    'Are you sure you want to delete activity <code>' + activityId + '</code>?' +
-    '<br><br>All activity records, including submissions, will be deleted as well.';
-  document.getElementById('btn-confirm-delete').disabled = false;
-  document.getElementById('btn-no-delete').disabled      = false;
-  document.getElementById('del-spinner').style.display   = 'none';
-  document.getElementById('delete-overlay').classList.add('open');
-  setTimeout(() => document.getElementById('btn-no-delete').focus(), 50);
-}}
-
-function closeDeleteConfirm() {{
-  document.getElementById('delete-overlay').classList.remove('open');
-  _pendingDeleteId = null;
-}}
-
-document.getElementById('delete-overlay').addEventListener('click', function(e) {{
-  if (e.target === this) closeDeleteConfirm();
-}});
-
-async function confirmDelete() {{
-  if (!_pendingDeleteId) return;
-  const activityId = _pendingDeleteId;
-
-  document.getElementById('btn-confirm-delete').disabled = true;
-  document.getElementById('btn-no-delete').disabled      = true;
-  document.getElementById('del-spinner').style.display   = 'block';
-
-  try {{
-    const resp = await fetch('/api/activity/' + encodeURIComponent(activityId), {{
-      method:  'DELETE',
-      headers: {{ 'Authorization': 'Bearer ' + BEARER_TOKEN }},
-    }});
-
-    if (!resp.ok) {{
-      const data = await resp.json().catch(() => ({{}}));
-      document.getElementById('del-body').innerHTML +=
-        '<br><br><span style="color:#a50e0e;font-weight:600">Error: ' +
-        (data.detail || 'Server error ' + resp.status) + '</span>';
-      document.getElementById('btn-confirm-delete').disabled = false;
-      document.getElementById('btn-no-delete').disabled      = false;
-      document.getElementById('del-spinner').style.display   = 'none';
-      return;
-    }}
-
-    closeDeleteConfirm();
-    await refreshActivities();
-
-  }} catch (err) {{
-    document.getElementById('del-body').innerHTML +=
-      '<br><br><span style="color:#a50e0e;font-weight:600">Network error: ' + err.message + '</span>';
-    document.getElementById('btn-confirm-delete').disabled = false;
-    document.getElementById('btn-no-delete').disabled      = false;
-    document.getElementById('del-spinner').style.display   = 'none';
-  }}
-}}
-</script>
+{_build_dashboard_script(safe_token, safe_email)}
 
 </body>
 </html>"""
