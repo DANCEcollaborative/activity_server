@@ -701,6 +701,8 @@ async def upload_roster(
 
         first = row.get("First Name", "").strip()
         last  = row.get("Last Name",  "").strip()
+        sid   = row.get("SID", "").strip() or None
+
         if first and last:
             name = f"{first} {last}"
         elif first:
@@ -715,11 +717,18 @@ async def upload_roster(
         # Upsert user
         user = db.query(User).filter(User.email == email).first()
         if user:
-            # Update name only if the new name is non-empty and different
             if name and name != user.name:
                 user.name = name
+            if first:
+                user.first_name = first
+            if last:
+                user.last_name = last
+            if sid is not None:
+                user.user_id = sid
         else:
-            user = User(name=name, email=email)
+            user = User(name=name, email=email,
+                        first_name=first or None, last_name=last or None,
+                        user_id=sid)
             db.add(user)
             db.flush()
 
@@ -1081,11 +1090,106 @@ async def update_score(data: ScoreUpdate, db: Session = Depends(get_db)):
 # Download endpoints
 # ──────────────────────────────────────────────
 
+import csv as _csv
+import io as _io
+
+
+def _csv_val(v):
+    """Return empty string for None/falsy, otherwise the value as a string."""
+    if v is None:
+        return ""
+    return str(v)
+
+
+@app.get("/download-roster/{activity_id}")
+async def download_roster(activity_id: str, db: Session = Depends(get_db)):
+    """Download a CSV roster for an activity (5e).
+    Columns: First Name, Last Name, SID, Email, Role, Section"""
+    activity = db.query(Activity).filter(Activity.activity_id == activity_id).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    enrollments = (
+        db.query(UserActivity)
+        .filter(UserActivity.activity_id == activity_id)
+        .all()
+    )
+
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(["First Name", "Last Name", "SID", "Email", "Role", "Section"])
+    for ua in enrollments:
+        user = db.query(User).filter(User.id == ua.user_id).first()
+        if not user:
+            continue
+        writer.writerow([
+            _csv_val(user.first_name),
+            _csv_val(user.last_name),
+            _csv_val(user.user_id),
+            _csv_val(user.email),
+            _csv_val(ua.role),
+            _csv_val(activity.section),
+        ])
+
+    filename = f"roster_{activity_id}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue().encode("utf-8")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/download-scores/{activity_id}")
+async def download_scores(activity_id: str, db: Session = Depends(get_db)):
+    """Download a CSV of latest scores for an activity (5f).
+    Columns: First Name, Last Name, SID, Email, Role, Section, Score"""
+    activity = db.query(Activity).filter(Activity.activity_id == activity_id).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    enrollments = (
+        db.query(UserActivity)
+        .filter(UserActivity.activity_id == activity_id)
+        .all()
+    )
+
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(["First Name", "Last Name", "SID", "Email", "Role", "Section", "Score"])
+    for ua in enrollments:
+        user = db.query(User).filter(User.id == ua.user_id).first()
+        if not user:
+            continue
+        latest = (
+            db.query(Submission)
+            .filter(Submission.user_activity_id == ua.id)
+            .order_by(Submission.submitted_at.desc())
+            .first()
+        )
+        score = _csv_val(latest.score if latest else None)
+        writer.writerow([
+            _csv_val(user.first_name),
+            _csv_val(user.last_name),
+            _csv_val(user.user_id),
+            _csv_val(user.email),
+            _csv_val(ua.role),
+            _csv_val(activity.section),
+            score,
+        ])
+
+    filename = f"scores_{activity_id}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue().encode("utf-8")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 @app.get("/download/{activity_id}/{email:path}")
 async def download_notebook(
     activity_id: str,
     email: str,
     submission_id: int = None,
+    dl_name: str = None,
     db: Session = Depends(get_db),
 ):
     user = db.query(User).filter(User.email == email).first()
@@ -1115,8 +1219,11 @@ async def download_notebook(
     if not sub or not sub.notebook:
         raise HTTPException(status_code=404, detail="Notebook not found")
 
-    safe_email = email.replace("@", "_at_").replace(".", "_")
-    filename = sub.notebook_filename or f"{safe_email}_{activity_id}.ipynb"
+    if dl_name:
+        filename = dl_name if dl_name.endswith(".ipynb") else dl_name + ".ipynb"
+    else:
+        safe_email = email.replace("@", "_at_").replace(".", "_")
+        filename = sub.notebook_filename or f"{safe_email}_{activity_id}.ipynb"
     content = _to_bytes(sub.notebook)
     return StreamingResponse(
         iter([content]),
@@ -1130,6 +1237,7 @@ async def download_feedback(
     activity_id: str,
     email: str,
     submission_id: int = None,
+    dl_name: str = None,
     db: Session = Depends(get_db),
 ):
     user = db.query(User).filter(User.email == email).first()
@@ -1160,8 +1268,11 @@ async def download_feedback(
         raise HTTPException(status_code=404, detail="Submission not found")
 
     feedback_text = sub.feedback or "No feedback available."
-    safe_email = email.replace("@", "_at_").replace(".", "_")
-    filename = f"feedback_{safe_email}_{activity_id}.txt"
+    if dl_name:
+        filename = dl_name if dl_name.endswith(".txt") else dl_name + ".txt"
+    else:
+        safe_email = email.replace("@", "_at_").replace(".", "_")
+        filename = f"feedback_{safe_email}_{activity_id}.txt"
     return StreamingResponse(
         iter([feedback_text.encode()]),
         media_type="text/plain",
@@ -1401,89 +1512,160 @@ DASHBOARD_CSS = """
 
 def _build_activity_cards(instructor, db) -> str:
     """Return the inner HTML for all activity cards belonging to an instructor."""
+    from datetime import datetime, timezone, timedelta
+
+    # ── Pittsburgh ET timezone (EST=UTC-5, EDT=UTC-4) ────────────────
+    now_utc = datetime.now(timezone.utc)
+
+    def _nth_sunday(year, month, n):
+        from calendar import monthrange
+        count, day = 0, 1
+        while day <= monthrange(year, month)[1]:
+            if datetime(year, month, day).weekday() == 6:
+                count += 1
+                if count == n:
+                    return day
+            day += 1
+        return day
+
+    yr = now_utc.year
+    dst_start = datetime(yr, 3,  _nth_sunday(yr, 3,  2), 2, tzinfo=timezone.utc) + timedelta(hours=5)
+    dst_end   = datetime(yr, 11, _nth_sunday(yr, 11, 1), 2, tzinfo=timezone.utc) + timedelta(hours=4)
+    is_dst   = dst_start <= now_utc < dst_end
+    et_zone  = timezone(timedelta(hours=-4 if is_dst else -5))
+    tz_label = "EDT" if is_dst else "EST"
+
+    def _fmt_et(ts_str):
+        if not ts_str:
+            return ""
+        try:
+            ts = ts_str.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(et_zone).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ts_str
+
     cards = ""
     for act in instructor.activities:
-        rows = ""
         enrollments = (
             db.query(UserActivity)
             .filter(UserActivity.activity_id == act.activity_id)
             .all()
         )
 
+        # Gather all enrolled users and their latest submission
+        user_rows       = []   # (user, ua, latest_sub|None, sub_count)
+        has_students    = False
+        any_submissions = False
+
         for ua in enrollments:
-            submissions = (
+            user = db.query(User).filter(User.id == ua.user_id).first()
+            if not user:
+                continue
+            if ua.role == "Student":
+                has_students = True
+            subs = (
                 db.query(Submission)
                 .filter(Submission.user_activity_id == ua.id)
                 .order_by(Submission.submitted_at.desc())
                 .all()
             )
-            if not submissions:
-                continue
+            latest = subs[0] if subs else None
+            if latest:
+                any_submissions = True
+            user_rows.append((user, ua, latest, len(subs)))
 
-            user = db.query(User).filter(User.id == ua.user_id).first()
-            user_email = user.email if user else "unknown"
-
-            latest = submissions[0]
-            submission_count = len(submissions)
-
-            if latest.score is None:
-                score_cell = '<span class="badge-grading">Grading…</span>'
+        # ── Table rows (5d) ───────────────────────────────────────────
+        rows_html = ""
+        for user, ua, latest, sub_count in user_rows:
+            safe_dl = user.email.replace("@", "-at-")
+            if latest:
+                time_cell  = _fmt_et(latest.submitted_at)
+                count_cell = str(sub_count)
+                score_cell = (
+                    '<span class="badge-grading">Grading…</span>'
+                    if latest.score is None
+                    else f'<span class="badge-score">{latest.score:.2f}</span>'
+                )
+                # 6 / 6a: named download files
+                nb_name = f"notebook_{act.activity_id}_{safe_dl}"
+                fb_name = f"feedback_{act.activity_id}_{safe_dl}"
+                dl_url  = (f"/download/{act.activity_id}/{user.email}"
+                           f"?submission_id={latest.id}&dl_name={nb_name}")
+                fb_url  = (f"/download-feedback/{act.activity_id}/{user.email}"
+                           f"?submission_id={latest.id}&dl_name={fb_name}")
+                fb_btn  = (
+                    f'<a class="btn btn-fb" href="{fb_url}">Feedback</a>'
+                    if latest.feedback
+                    else '<span style="color:#aaa;font-size:.8rem">—</span>'
+                )
+                actions = f'<a class="btn btn-dl" href="{dl_url}">Download</a>{fb_btn}'
             else:
-                score_cell = f'<span class="badge-score">{latest.score:.2f}</span>'
+                time_cell = count_cell = score_cell = actions = ""
 
-            dl_url = f"/download/{act.activity_id}/{user_email}?submission_id={latest.id}"
-            fb_url = f"/download-feedback/{act.activity_id}/{user_email}?submission_id={latest.id}"
-
-            feedback_btn = (
-                f'<a class="btn btn-fb" href="{fb_url}">Feedback</a>'
-                if latest.feedback
-                else '<span style="color:#aaa;font-size:.8rem">—</span>'
-            )
-
-            rows += f"""
+            rows_html += f"""
             <tr>
-              <td>{user_email}</td>
-              <td>{submission_count}</td>
-              <td>{latest.submitted_at or ''}</td>
+              <td>{user.email}</td>
+              <td>{count_cell}</td>
+              <td>{time_cell}</td>
               <td>{score_cell}</td>
-              <td>
-                <a class="btn btn-dl" href="{dl_url}">Download</a>
-                {feedback_btn}
-              </td>
+              <td>{actions}</td>
             </tr>"""
 
+        # ── Download Roster row (5e) ──────────────────────────────────
+        if user_rows:
+            rows_html += f"""
+            <tr>
+              <td><a class="btn btn-dl" href="/download-roster/{act.activity_id}">⬇ Download Roster</a></td>
+              <td></td><td></td><td></td><td></td>
+            </tr>"""
+
+        # ── Download Scores row (5f) ──────────────────────────────────
+        if any_submissions:
+            rows_html += f"""
+            <tr>
+              <td></td><td></td><td></td>
+              <td><a class="btn btn-dl" href="/download-scores/{act.activity_id}">⬇ Download Scores</a></td>
+              <td></td>
+            </tr>"""
+
+        if not rows_html:
+            rows_html = '<tr><td colspan="5" style="color:#aaa">No users enrolled</td></tr>'
+
+        # ── Card metadata ─────────────────────────────────────────────
         meta_parts = []
         if act.section:  meta_parts.append(f"Section {act.section}")
         if act.semester: meta_parts.append(act.semester)
         if act.year:     meta_parts.append(str(act.year))
-        meta_str = " · ".join(meta_parts)
+        meta_str  = " · ".join(meta_parts)
         meta_html = f'<span class="activity-meta">{meta_str}</span>' if meta_str else ""
 
-        # Escape activity_id for safe use in JS string (single-quoted)
-        safe_act_id = act.activity_id.replace("'", "\\'")
+        safe_act_id   = act.activity_id.replace("'", "\\'")
+        safe_act_name = act.activity_name.replace("'", "\\'").replace("\\", "\\\\")
+        safe_semester = (act.semester or "").replace("'", "\\'")
+        act_year      = act.year or ""
 
-        # Enable/Disable toggle button
+        # 4/5a: blue=Enable, grey=Disable
         if act.enabled:
-            toggle_cls   = "btn-toggle-activity enabled"
+            toggle_cls   = "btn-toggle-activity disabled"
             toggle_label = "Disable"
             toggle_title = "Click to disable this activity"
         else:
-            toggle_cls   = "btn-toggle-activity disabled"
+            toggle_cls   = "btn-toggle-activity enabled"
             toggle_label = "Enable"
             toggle_title = "Click to enable this activity"
 
-        # Disabled badge in title
         disabled_badge = (
-            '' if act.enabled
+            "" if act.enabled
             else ' <span style="background:#e8eaed;color:#5f6368;font-size:.72rem;'
                  'font-weight:600;padding:1px 7px;border-radius:10px;vertical-align:middle">'
                  'DISABLED</span>'
         )
 
-        # Build JS object of activity data for the update modal
-        safe_act_name = act.activity_name.replace("'", "\\'").replace("\\", "\\\\")
-        safe_semester = (act.semester or "").replace("'", "\\'")
-        act_year      = act.year or ""
+        # 3b: roster button label
+        roster_btn_lbl = "Update Roster" if has_students else "Add Roster"
 
         cards += f"""
         <div class="activity-card">
@@ -1496,7 +1678,7 @@ def _build_activity_cards(instructor, db) -> str:
               {toggle_label}
             </button>
             <button class="btn-update-roster"
-                    onclick="openUpdateModal({{activity_id:'{safe_act_id}',activity_name:'{safe_act_name}',year:'{act_year}',semester:'{safe_semester}',enabled:{str(act.enabled).lower()}}})">
+                    onclick="openUpdateModal({{activity_id:'{safe_act_id}',activity_name:'{safe_act_name}',year:'{act_year}',semester:'{safe_semester}',enabled:{str(act.enabled).lower()},has_students:{str(has_students).lower()}}})">
               ↺ Update Activity
             </button>
             <input type="file" id="ur-input-{act.activity_id}"
@@ -1510,12 +1692,12 @@ def _build_activity_cards(instructor, db) -> str:
           <table>
             <thead>
               <tr>
-                <th>Email</th>
-                <th>Submissions</th><th>Latest Submitted</th>
+                <th>Email</th><th>Submissions</th>
+                <th>Latest Submission ({tz_label})</th>
                 <th>Latest Score</th><th>Actions</th>
               </tr>
             </thead>
-            <tbody>{rows or '<tr><td colspan="5" style="color:#aaa">No submissions yet</td></tr>'}</tbody>
+            <tbody>{rows_html}</tbody>
           </table>
         </div>"""
 
@@ -1610,7 +1792,7 @@ function openModal() {
 
 /**
  * Open in "Update" mode for an existing activity.
- * activityData = { activity_id, activity_name, year, semester, enabled }
+ * activityData = { activity_id, activity_name, year, semester, enabled, has_students }
  */
 function openUpdateModal(activityData) {
   _openActivityModal({ mode: 'update', data: activityData });
@@ -1627,6 +1809,11 @@ function _openActivityModal(opts) {
     isUpdate ? 'Update Activity' : 'Add Activity';
 
   if (isUpdate) {
+    // Set roster button label (3b)
+    const rosterBtn = document.getElementById('roster-btn');
+    if (rosterBtn) {
+      rosterBtn.textContent = data.has_students ? 'Update Roster' : 'Add Roster';
+    }
     // Pre-fill fields
     document.getElementById('f-activity-name').value = data.activity_name || '';
     document.getElementById('f-year').value           = data.year          || '';
@@ -1700,8 +1887,10 @@ function resetModal() {
   // Reset enabled radio to "Enable" (default)
   document.getElementById('f-enabled-yes').checked = true;
 
-  document.getElementById('f-roster').value                = '';
-  document.getElementById('file-name-display').textContent = 'No file chosen';
+  document.getElementById('f-roster').value  = '';
+  document.getElementById('file-name-display').textContent = '';
+  const rosterBtn = document.getElementById('roster-btn');
+  if (rosterBtn) rosterBtn.textContent = 'Add Roster';
   window._rosterSection   = '';
   hideError();
   hideSuccess();
@@ -2143,7 +2332,7 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
       <div style="display:flex;gap:14px">
         <div class="field" style="flex:1">
           <label for="f-year">Year <span class="req">*</span></label>
-          <input type="number" id="f-year" placeholder="e.g. 2024" min="2000" max="2099">
+          <input type="number" id="f-year" placeholder="e.g. 2026" min="2000" max="2099">
         </div>
         <div class="field" style="flex:1">
           <label for="f-semester">Semester <span class="req">*</span></label>
@@ -2203,12 +2392,13 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
       <div class="field">
         <label>Roster CSV <span style="color:#888;font-weight:400">(optional)</span></label>
         <div class="file-row">
-          <button class="btn-browse" type="button" onclick="document.getElementById('f-roster').click()">
+          <button class="btn-browse" type="button" id="roster-btn"
+                  onclick="document.getElementById('f-roster').click()">
             Add Roster
           </button>
           <input type="file" id="f-roster" accept=".csv,text/csv"
                  onchange="onFileChosen(this)">
-          <span class="file-name" id="file-name-display">No file chosen</span>
+          <span class="file-name" id="file-name-display"></span>
         </div>
         <div class="hint">
           Expected columns: First Name, Last Name, SID, Email, Role, Section.
@@ -2376,6 +2566,8 @@ async def update_roster(
 
         first = row.get("First Name", "").strip()
         last  = row.get("Last Name",  "").strip()
+        sid   = row.get("SID", "").strip() or None
+
         if first and last:
             name = f"{first} {last}"
         elif first:
@@ -2392,8 +2584,16 @@ async def update_roster(
         if user:
             if name and name != user.name:
                 user.name = name
+            if first:
+                user.first_name = first
+            if last:
+                user.last_name = last
+            if sid is not None:
+                user.user_id = sid
         else:
-            user = User(name=name, email=email)
+            user = User(name=name, email=email,
+                        first_name=first or None, last_name=last or None,
+                        user_id=sid)
             db.add(user)
             db.flush()
 
