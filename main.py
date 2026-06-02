@@ -409,6 +409,15 @@ async def create_or_update_activity(
     return {"status": "ok", "activity_id": activity_id}
 
 
+@app.get("/api/activity/{activity_id}/exists")
+async def activity_id_exists(activity_id: str, db: Session = Depends(get_db)):
+    """Return {"exists": true/false} for the given activity_id. Used by the GUI."""
+    exists = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first() is not None
+    return {"exists": exists}
+
+
 @app.delete("/api/activity/{activity_id}")
 async def delete_activity(
     activity_id: str,
@@ -1665,8 +1674,14 @@ def _build_activity_cards(instructor, db) -> str:
                 any_submissions = True
             user_rows.append((user, ua, latest, len(subs)))
 
-        # ── Table rows (5d) ───────────────────────────────────────────
+        # ── Table rows ────────────────────────────────────────────────
         rows_html = ""
+        has_roster = bool(user_rows)   # any enrolled users = has roster
+        any_scores = any(
+            latest is not None and latest.score is not None
+            for _, _, latest, _ in user_rows
+        )
+
         for user, ua, latest, sub_count in user_rows:
             safe_dl = user.email.replace("@", "-at-")
             if latest:
@@ -1677,7 +1692,6 @@ def _build_activity_cards(instructor, db) -> str:
                     if latest.score is None
                     else f'<span class="badge-score">{latest.score:.2f}</span>'
                 )
-                # 6 / 6a: named download files
                 nb_name = f"notebook_{act.activity_id}_{safe_dl}"
                 fb_name = f"feedback_{act.activity_id}_{safe_dl}"
                 dl_url  = (f"/download/{act.activity_id}/{user.email}"
@@ -1702,17 +1716,28 @@ def _build_activity_cards(instructor, db) -> str:
               <td>{actions}</td>
             </tr>"""
 
-        # ── Download Roster + Scores row (5e / 5f / item 2) ─────────────
-        if user_rows:
-            scores_btn = ""
-            if any_submissions:
-                scores_btn = f' <a class="btn btn-dl" href="/download-scores/{act.activity_id}">⬇ Download Scores</a>'
+        # ── Download Roster / Scores row (items 2, 3, 4) ─────────────
+        # Roster button: only when there are enrolled users (item 3)
+        # Scores button: only when there are actual numeric scores (item 4)
+        # Both in the same row; Scores sits in the Latest Score column (item 2)
+        roster_dl_btn = (
+            f'<a class="btn btn-dl" href="/download-roster/{act.activity_id}">⬇ Download Roster</a>'
+            if has_roster else ""
+        )
+        scores_dl_btn = (
+            f'<a class="btn btn-dl" href="/download-scores/{act.activity_id}">⬇ Download Scores</a>'
+            if any_scores else ""
+        )
+        if roster_dl_btn or scores_dl_btn:
             rows_html += f"""
             <tr>
-              <td><a class="btn btn-dl" href="/download-roster/{act.activity_id}">⬇ Download Roster</a>{scores_btn}</td>
-              <td></td><td></td><td></td><td></td>
+              <td>{roster_dl_btn}</td>
+              <td></td><td></td>
+              <td>{scores_dl_btn}</td>
+              <td></td>
             </tr>"""
 
+        # Issue 1: show activity even with no enrollments
         if not rows_html:
             rows_html = '<tr><td colspan="5" style="color:#aaa">No users enrolled</td></tr>'
 
@@ -1841,8 +1866,11 @@ function updateActivityId() {
   if (idField.dataset.manual === 'true' || idField.readOnly) return;
   const auto = buildAutoId();
   idField.value = auto;
-  refreshIdBadge(auto);
+  refreshIdBadge(auto, null);
 }
+
+// Debounce timer for the uniqueness check
+let _idCheckTimer = null;
 
 function onActivityIdInput(input) {
   if (input.readOnly) return;  // locked in update mode
@@ -1850,17 +1878,67 @@ function onActivityIdInput(input) {
   input.value = input.value.toLowerCase();
   input.setSelectionRange(pos, pos);
   input.dataset.manual = input.value !== '' ? 'true' : 'false';
-  refreshIdBadge(input.value);
+
+  const val = input.value;
+  if (!val || val.includes('tbd-xxx')) {
+    refreshIdBadge(val, null);
+    return;
+  }
+  if (!RFC1123_RE.test(val)) {
+    refreshIdBadge(val, null);   // show invalid format immediately
+    return;
+  }
+  // Valid format: debounce a uniqueness check
+  clearTimeout(_idCheckTimer);
+  refreshIdBadge(val, 'checking');
+  _idCheckTimer = setTimeout(() => _checkIdUnique(val), 400);
 }
 
-function refreshIdBadge(value) {
+async function _checkIdUnique(val) {
+  // Only act if the field still holds this value
+  const field = document.getElementById('f-activity-id');
+  if (field.value !== val) return;
+  try {
+    const resp = await fetch('/api/activity/' + encodeURIComponent(val) + '/exists');
+    const data = await resp.json().catch(() => ({}));
+    if (field.value !== val) return;  // user typed again
+    refreshIdBadge(val, data.exists ? 'taken' : 'free');
+  } catch (_) {
+    refreshIdBadge(val, null);  // network error: fall back to format-only
+  }
+}
+
+/**
+ * Update the Activity ID validation badge.
+ * state: null = format-only, 'checking' = spinner, 'free' = unique, 'taken' = duplicate
+ */
+function refreshIdBadge(value, state) {
   const badge = document.getElementById('id-valid-badge');
   if (!value || value.includes('tbd-xxx')) { badge.style.display = 'none'; return; }
-  const ok = RFC1123_RE.test(value);
-  badge.style.display    = 'inline';
-  badge.textContent      = ok ? '\u2713 valid' : '\u2717 invalid format';
-  badge.style.background = ok ? '#e6f4ea' : '#fce8e6';
-  badge.style.color      = ok ? '#137333' : '#c5221f';
+  const fmtOk = RFC1123_RE.test(value);
+  badge.style.display = 'inline';
+  if (!fmtOk) {
+    badge.textContent      = '\u2717 invalid format';
+    badge.style.background = '#fce8e6';
+    badge.style.color      = '#c5221f';
+  } else if (state === 'checking') {
+    badge.textContent      = '\u29d6 checking\u2026';
+    badge.style.background = '#e8f0fe';
+    badge.style.color      = '#1a73e8';
+  } else if (state === 'taken') {
+    badge.textContent      = '\u2717 already in use';
+    badge.style.background = '#fce8e6';
+    badge.style.color      = '#c5221f';
+  } else if (state === 'free') {
+    badge.textContent      = '\u2713 valid and available';
+    badge.style.background = '#e6f4ea';
+    badge.style.color      = '#137333';
+  } else {
+    // format valid, uniqueness unknown
+    badge.textContent      = '\u2713 valid format';
+    badge.style.background = '#e6f4ea';
+    badge.style.color      = '#137333';
+  }
 }
 
 // ── Modal open / close ───────────────────────────────────────────────
@@ -2081,6 +2159,15 @@ async function submitActivity() {
       'Example: intro-to-ai-2026-fall-11637-b'
     );
     return;
+  }
+
+  // Block if activity_id is manually set and already taken (issue 5)
+  if (!isUpdate && activityId && !idLooksTbd) {
+    const badge = document.getElementById('id-valid-badge');
+    if (badge && badge.textContent.includes('already in use')) {
+      showError('That Activity ID is already in use. Please choose a different one.');
+      return;
+    }
   }
 
   setLoading(true);
