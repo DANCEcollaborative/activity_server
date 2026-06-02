@@ -352,6 +352,7 @@ def _generate_tbd_activity_id(base: str, db) -> str:
 
 @app.post("/api/activity")
 async def create_or_update_activity(
+    request: Request,
     activity_id: str = Form(None),   # optional on create; required when updating
     activity_name: str = Form(...),
     enabled: bool = Form(True),
@@ -361,6 +362,8 @@ async def create_or_update_activity(
     semester: str = Form(None),
     db: Session = Depends(get_db),
 ):
+    instructor = require_instructor(request, db)
+
     activity = db.query(Activity).filter(
         Activity.activity_id == activity_id
     ).first() if activity_id else None
@@ -404,6 +407,11 @@ async def create_or_update_activity(
             semester=semester,
         )
         db.add(activity)
+        db.flush()  # ensure activity.activity_id is set before appending
+
+    # Link activity to this instructor (idempotent)
+    if activity not in instructor.activities:
+        instructor.activities.append(activity)
 
     db.commit()
     return {"status": "ok", "activity_id": activity_id}
