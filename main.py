@@ -319,13 +319,40 @@ async def trigger_grading(submission_id: int, db: Session = Depends(get_db)):
     return {"status": "grading started", "submission_id": submission_id}
 
 
+import re as _re_global
+
+_RFC1123_RE_STR = r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+
+
+def _to_rfc1123_segment(s: str) -> str:
+    """Lowercase, replace non-[a-z0-9] runs with '-', strip edge hyphens."""
+    return _re_global.sub(r'^-+|-+$', '', _re_global.sub(r'[^a-z0-9]+', '-', s.lower()))
+
+
+def _is_tbd_activity_id(activity_id: str) -> bool:
+    """Return True if this is a temporary TBD activity ID (contains '-tbd-NNN' suffix)."""
+    return bool(_re_global.search(r'-tbd-\d{3}$', activity_id))
+
+
+def _generate_tbd_activity_id(base: str, db) -> str:
+    """
+    Given a base slug (name-year-semester), find the lowest available
+    base-tbd-NNN (001..999) that does not conflict with an existing activity_id.
+    """
+    for n in range(1, 1000):
+        candidate = f"{base}-tbd-{n:03d}"
+        if not db.query(Activity).filter(Activity.activity_id == candidate).first():
+            return candidate
+    raise HTTPException(status_code=500, detail="Could not generate a unique TBD activity ID")
+
+
 # ──────────────────────────────────────────────
 # Activity endpoints
 # ──────────────────────────────────────────────
 
 @app.post("/api/activity")
 async def create_or_update_activity(
-    activity_id: str = Form(...),
+    activity_id: str = Form(None),   # optional on create; required when updating
     activity_name: str = Form(...),
     enabled: bool = Form(True),
     task_graders: str = Form(None),
@@ -336,7 +363,7 @@ async def create_or_update_activity(
 ):
     activity = db.query(Activity).filter(
         Activity.activity_id == activity_id
-    ).first()
+    ).first() if activity_id else None
 
     if activity:
         # 3g: activity_name CAN be updated; activity_id cannot (it's the PK)
@@ -351,6 +378,22 @@ async def create_or_update_activity(
         if semester is not None:
             activity.semester = semester
     else:
+        # ── Generate activity_id if not supplied ──────────────────────
+        if not activity_id:
+            if year and semester and activity_name:
+                parts = [_to_rfc1123_segment(p)
+                         for p in [activity_name, str(year), semester] if p]
+                parts = [p for p in parts if p]
+                base = '-'.join(parts)
+            else:
+                base = _to_rfc1123_segment(activity_name) if activity_name else "activity"
+            # No roster → TBD section placeholder (1b)
+            activity_id = _generate_tbd_activity_id(base, db)
+        elif not _re_global.match(_RFC1123_RE_STR, activity_id):
+            raise HTTPException(
+                status_code=422,
+                detail=f"activity_id '{activity_id}' does not meet RFC 1123 rules.",
+            )
         activity = Activity(
             activity_id=activity_id,
             activity_name=activity_name,
@@ -605,40 +648,85 @@ async def upload_roster(
         )
 
     # ── Find or create the Activity ───────────────────────────────────
-    existing_activity = (
-        db.query(Activity)
-        .filter(
-            Activity.activity_name == activity_name,
-            Activity.section       == section,
-            Activity.year          == year,
-            Activity.semester      == semester,
+    existing_activity = None
+
+    # 1c: If a specific activity_id was passed and it's a TBD id, look it up directly
+    if activity_id and _is_tbd_activity_id(activity_id):
+        existing_activity = db.query(Activity).filter(
+            Activity.activity_id == activity_id
+        ).first()
+
+    # Otherwise search by (name, section, year, semester)
+    if not existing_activity:
+        existing_activity = (
+            db.query(Activity)
+            .filter(
+                Activity.activity_name == activity_name,
+                Activity.section       == section,
+                Activity.year          == year,
+                Activity.semester      == semester,
+            )
+            .first()
         )
-        .first()
-    )
+
+    # xd: If the found activity has a real (non-TBD) section, reject a mismatched section
+    if existing_activity and not _is_tbd_activity_id(existing_activity.activity_id):
+        if existing_activity.section and existing_activity.section != section:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Activity '{existing_activity.activity_id}' already has section "
+                    f"'{existing_activity.section}'. A roster with a different section "
+                    f"('{section}') may not be uploaded to it."
+                ),
+            )
 
     if existing_activity:
         activity = existing_activity
         is_new_activity = False
+
+        # 1c: Replace TBD activity_id with the real section-based id
+        if _is_tbd_activity_id(activity.activity_id):
+            import re as _re
+            def _to_seg(s):
+                return _re.sub(r'^-+|-+$', '', _re.sub(r'[^a-z0-9]+', '-', s.lower()))
+            parts = [_to_seg(p) for p in [activity_name, str(year), semester, section] if p]
+            new_id = '-'.join([p for p in parts if p])
+
+            # Validate and ensure uniqueness
+            if not _re.match(_RFC1123_RE_STR, new_id):
+                new_id = activity.activity_id  # keep TBD if something's wrong
+            elif db.query(Activity).filter(Activity.activity_id == new_id).first():
+                new_id = activity.activity_id  # already exists; keep TBD
+            else:
+                # Cascade update all FKs pointing to the old activity_id
+                old_id = activity.activity_id
+                db.query(UserActivity).filter(
+                    UserActivity.activity_id == old_id
+                ).update({"activity_id": new_id}, synchronize_session=False)
+                # Update the activity_instructors join table
+                from sqlalchemy import text as _text
+                db.execute(
+                    _text("UPDATE activity_instructors SET activity_id=:new WHERE activity_id=:old"),
+                    {"new": new_id, "old": old_id},
+                )
+                activity.activity_id = new_id
+                activity.section = section
+                db.flush()
+                activity_id = new_id
     else:
         # Derive an activity_id if one was not supplied.
         # Follows RFC 1123 subdomain rules: lowercase alphanumeric + hyphens,
         # must start and end with an alphanumeric character.
         if not activity_id:
-            import re as _re
-            def _to_rfc1123_segment(s: str) -> str:
-                """Lower-case s, replace non-[a-z0-9] runs with '-', strip edge hyphens."""
-                return _re.sub(r'^-+|-+$', '', _re.sub(r'[^a-z0-9]+', '-', s.lower()))
-
-            # Order: name - year - semester - section  (matches frontend 3e)
+            # Order: name - year - semester - section
             parts = [_to_rfc1123_segment(p) for p in
                      [activity_name, str(year), semester, section] if p]
             parts = [p for p in parts if p]   # drop any empty segments
             activity_id = '-'.join(parts)
 
         # Check the supplied activity_id isn't already in use by a different activity
-        import re as _re
-        _RFC1123_RE = r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
-        if not _re.match(_RFC1123_RE, activity_id):
+        if not _re_global.match(_RFC1123_RE_STR, activity_id):
             raise HTTPException(
                 status_code=422,
                 detail=(
@@ -1614,21 +1702,15 @@ def _build_activity_cards(instructor, db) -> str:
               <td>{actions}</td>
             </tr>"""
 
-        # ── Download Roster row (5e) ──────────────────────────────────
+        # ── Download Roster + Scores row (5e / 5f / item 2) ─────────────
         if user_rows:
+            scores_btn = ""
+            if any_submissions:
+                scores_btn = f' <a class="btn btn-dl" href="/download-scores/{act.activity_id}">⬇ Download Scores</a>'
             rows_html += f"""
             <tr>
-              <td><a class="btn btn-dl" href="/download-roster/{act.activity_id}">⬇ Download Roster</a></td>
+              <td><a class="btn btn-dl" href="/download-roster/{act.activity_id}">⬇ Download Roster</a>{scores_btn}</td>
               <td></td><td></td><td></td><td></td>
-            </tr>"""
-
-        # ── Download Scores row (5f) ──────────────────────────────────
-        if any_submissions:
-            rows_html += f"""
-            <tr>
-              <td></td><td></td><td></td>
-              <td><a class="btn btn-dl" href="/download-scores/{act.activity_id}">⬇ Download Scores</a></td>
-              <td></td>
             </tr>"""
 
         if not rows_html:
@@ -1729,7 +1811,9 @@ function toRFC1123Segment(str) {
 
 /**
  * Auto-generate activity_id from: name – year – semester – section.
- * Section comes from the CSV file (stored in window._rosterSection).
+ * When no section is available (no roster chosen yet), the section
+ * component is replaced by tbd-NNN (1b).  The server assigns the
+ * actual NNN; the browser just shows a preview with tbd-xxx.
  */
 function buildAutoId() {
   const name     = document.getElementById('f-activity-name').value.trim();
@@ -1739,16 +1823,14 @@ function buildAutoId() {
 
   if (!name || !year || !semester) return '';
 
-  // Order: name - year - semester - section  (3f / 3e)
-  const rawParts = section
-    ? [name, year, semester, section]
-    : [name, year, semester];
+  // Order: name - year - semester - section  (3e/3f)
+  // If no section yet, use tbd-xxx as a preview placeholder
+  const sectionSlug = section ? toRFC1123Segment(section) : 'tbd-xxx';
+  const parts = [name, year, semester].map(toRFC1123Segment).filter(Boolean);
+  parts.push(sectionSlug);
+  if (parts.some(p => !p)) return '';
 
-  const parts = rawParts.map(toRFC1123Segment).filter(Boolean);
-  if (parts.length < (section ? 4 : 3)) return '';
-
-  const candidate = parts.join('-');
-  return RFC1123_RE.test(candidate) ? candidate : '';
+  return parts.join('-');
 }
 
 // ── Activity-ID live update & validation ─────────────────────────────
@@ -1773,7 +1855,7 @@ function onActivityIdInput(input) {
 
 function refreshIdBadge(value) {
   const badge = document.getElementById('id-valid-badge');
-  if (!value) { badge.style.display = 'none'; return; }
+  if (!value || value.includes('tbd-xxx')) { badge.style.display = 'none'; return; }
   const ok = RFC1123_RE.test(value);
   badge.style.display    = 'inline';
   badge.textContent      = ok ? '\u2713 valid' : '\u2717 invalid format';
@@ -1821,15 +1903,27 @@ function _openActivityModal(opts) {
     Array.from(semSel.options).forEach(o => { o.selected = (o.value === data.semester); });
     semSel.dispatchEvent(new Event('change'));   // trigger auto-ID (will be ignored due to readOnly)
 
-    // Lock the activity_id field (3g)
+    // Lock/unlock the activity_id field depending on TBD status (xd / 3g)
     const idField = document.getElementById('f-activity-id');
-    idField.value    = data.activity_id || '';
-    idField.readOnly = true;
-    idField.style.background = '#f8f9fa';
-    idField.style.color      = '#5f6368';
-    document.getElementById('id-optional-label').style.display = 'none';
-    document.getElementById('id-locked-label').style.display   = 'inline';
-    document.getElementById('id-valid-badge').style.display    = 'none';
+    idField.value = data.activity_id || '';
+    const isTbd = (data.activity_id || '').includes('-tbd-');
+    if (isTbd) {
+      // TBD id: editable so instructor can override, but show note
+      idField.readOnly = false;
+      idField.style.background = '';
+      idField.style.color      = '';
+      idField.dataset.manual   = 'false';
+      document.getElementById('id-optional-label').style.display = 'inline';
+      document.getElementById('id-locked-label').style.display   = 'none';
+    } else {
+      // Real section id: fully locked
+      idField.readOnly = true;
+      idField.style.background = '#f8f9fa';
+      idField.style.color      = '#5f6368';
+      document.getElementById('id-optional-label').style.display = 'none';
+      document.getElementById('id-locked-label').style.display   = 'inline';
+    }
+    document.getElementById('id-valid-badge').style.display = 'none';
 
     // Set enabled radio
     const enabledVal = (data.enabled === true || data.enabled === 'true') ? 'true' : 'false';
@@ -1976,8 +2070,10 @@ async function submitActivity() {
     return;
   }
 
-  // Activity ID validation only on create (it's locked on update)
-  if (!isUpdate && activityId && !RFC1123_RE.test(activityId)) {
+  // Activity ID validation only on create (it's locked on update).
+  // Skip validation for tbd-xxx preview strings (server will resolve them).
+  const idLooksTbd = activityId.includes('-tbd-') || activityId.endsWith('-tbd');
+  if (!isUpdate && activityId && !idLooksTbd && !RFC1123_RE.test(activityId)) {
     showError(
       'Activity ID has an invalid format.\\n' +
       'Use only lowercase letters, digits, hyphens (-) and dots (.).\\n' +
@@ -1997,7 +2093,13 @@ async function submitActivity() {
     fd.append('semester',         semester);
     fd.append('instructor_email', INSTRUCTOR_EMAIL);
     fd.append('roster',           rosterInput.files[0]);
-    if (activityId && !isUpdate) fd.append('activity_id', activityId);
+    // Pass existing id when updating (especially TBD ids needing section upgrade, 1c)
+    if (isUpdate) {
+      const existingId = document.getElementById('modal-overlay').dataset.activityId;
+      fd.append('activity_id', existingId);
+    } else if (activityId && !activityId.includes('tbd-xxx')) {
+      fd.append('activity_id', activityId);
+    }
 
     try {
       const resp = await fetch('/api/activity/roster', {
@@ -2030,10 +2132,12 @@ async function submitActivity() {
     fd.append('year',          String(yearInt));
     fd.append('semester',      semester);
     fd.append('enabled',       String(enabled));
-    if (activityId && !isUpdate) fd.append('activity_id', activityId);
+    // Always send activity_id when updating; on create only if manually set
     if (isUpdate) {
       const existingId = document.getElementById('modal-overlay').dataset.activityId;
       fd.append('activity_id', existingId);
+    } else if (activityId && !activityId.includes('tbd-xxx')) {
+      fd.append('activity_id', activityId);
     }
 
     try {
@@ -2352,27 +2456,6 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
                style="background:#f8f9fa;color:#555">
       </div>
 
-      <!-- Activity ID (optional on create, locked on update) -->
-      <div class="field">
-        <label for="f-activity-id">Activity ID
-          <span id="id-optional-label" style="color:#888;font-weight:400">(optional)</span>
-          <span id="id-locked-label"   style="color:#888;font-weight:400;display:none">(locked — cannot change after creation)</span>
-          <span id="id-valid-badge" style="display:none;margin-left:8px;font-size:.78rem;
-                font-weight:600;padding:1px 7px;border-radius:10px"></span>
-        </label>
-        <input type="text" id="f-activity-id"
-               placeholder="Auto-generated from fields above"
-               oninput="onActivityIdInput(this)">
-        <div class="hint">
-          Auto-generated from Activity Name + Year + Semester + Section.
-          You may edit it manually, but only during activity creation.
-          The Activity ID must follow RFC&nbsp;1123 subdomain format:
-          lowercase letters, digits, <code>-</code>, and <code>.</code> only;
-          must start and end with a letter or digit
-          (e.g.&nbsp;<code>intro-to-ai-2026-fall-11637-b</code>).
-        </div>
-      </div>
-
       <!-- Enable / Disable radio -->
       <div class="field">
         <label>Status <span class="req">*</span></label>
@@ -2403,6 +2486,30 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
         <div class="hint">
           Expected columns: First Name, Last Name, SID, Email, Role, Section.
           All rows must share a single Section value.
+        </div>
+      </div>
+
+      <!-- Activity ID — last field (1a); locked once a real section is set (xd) -->
+      <div class="field">
+        <label for="f-activity-id">Activity ID
+          <span id="id-optional-label" style="color:#888;font-weight:400">(optional)</span>
+          <span id="id-locked-label"   style="color:#888;font-weight:400;display:none">(locked — cannot change after creation)</span>
+          <span id="id-valid-badge" style="display:none;margin-left:8px;font-size:.78rem;
+                font-weight:600;padding:1px 7px;border-radius:10px"></span>
+        </label>
+        <input type="text" id="f-activity-id"
+               placeholder="Auto-generated from fields above"
+               oninput="onActivityIdInput(this)">
+        <div class="hint">
+          Auto-generated from Activity Name + Year + Semester + Section.
+          Without a roster, the Section component is set to <code>tbd-###</code>
+          (a unique 3-digit placeholder) and will be updated automatically when a
+          roster is first added.<br>
+          You may edit it manually, but only during activity creation.
+          The Activity ID must follow RFC&nbsp;1123 subdomain format:
+          lowercase letters, digits, <code>-</code>, and <code>.</code> only;
+          must start and end with a letter or digit
+          (e.g.&nbsp;<code>intro-to-ai-2026-fall-11637-b</code>).
         </div>
       </div>
 
