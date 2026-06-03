@@ -717,25 +717,32 @@ async def upload_roster(
                 new_id = activity.activity_id  # already exists; keep TBD
             else:
                 # ── Upgrade TBD id to real section-based id ───────────
-                # PostgreSQL enforces FK constraints per-statement (NOT
-                # DEFERRABLE by default). db.execute() normally triggers
-                # an ORM auto-flush first which tries to UPDATE activities,
-                # but that fails while activity_instructors still holds
-                # the old FK value.
-                #
-                # Fix: temporarily disable autoflush, expunge the dirty
-                # activity object so the ORM has nothing to flush, then
-                # run all three raw SQL statements in the correct order
-                # within the same session transaction:
-                #   1. user_activities       (child FK table)
-                #   2. activity_instructors  (child FK table)
-                #   3. activities            (parent PK — now safe)
+                # The activity_instructors FK is NOT DEFERRABLE by default,
+                # so PostgreSQL checks it per-statement. We need to either:
+                #   (a) defer it within this transaction, or
+                #   (b) temporarily drop and recreate it.
+                # We use SET CONSTRAINTS DEFERRED so the FK is only checked
+                # at COMMIT, letting us update parent and children in any order
+                # within the same transaction.
                 old_id = activity.activity_id
                 from sqlalchemy import text as _text
 
-                db.expunge(activity)  # remove dirty object from ORM identity map
+                # Expunge the ORM object so SQLAlchemy won't auto-flush it
+                db.expunge(activity)
 
                 with db.no_autoflush:
+                    # Defer FK checks until end of transaction
+                    db.execute(_text(
+                        "SET CONSTRAINTS activity_instructors_activity_id_fkey DEFERRED"
+                    ))
+
+                    # Now order doesn't matter — all constraints checked at commit
+                    db.execute(
+                        _text("UPDATE activities"
+                              " SET activity_id=:new, section=:section"
+                              " WHERE activity_id=:old"),
+                        {"new": new_id, "section": section, "old": old_id},
+                    )
                     db.execute(
                         _text("UPDATE user_activities"
                               " SET activity_id=:new WHERE activity_id=:old"),
@@ -745,12 +752,6 @@ async def upload_roster(
                         _text("UPDATE activity_instructors"
                               " SET activity_id=:new WHERE activity_id=:old"),
                         {"new": new_id, "old": old_id},
-                    )
-                    db.execute(
-                        _text("UPDATE activities"
-                              " SET activity_id=:new, section=:section"
-                              " WHERE activity_id=:old"),
-                        {"new": new_id, "section": section, "old": old_id},
                     )
 
                 # Reload the updated activity into the current session
