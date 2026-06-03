@@ -24,6 +24,7 @@ GET    /api/activities                  – list activities
 
 POST   /api/activity/roster             – upload a CSV roster to create/update an activity and enroll users
 POST   /api/activity/roster/update      – update enrollment for an existing activity from a new CSV roster
+POST   /api/activity/{activity_id}/graders  – set the task_graders directory path for an activity
 
 POST   /api/instructor                  – add instructor / assign activity
 
@@ -318,13 +319,41 @@ async def trigger_grading(submission_id: int, db: Session = Depends(get_db)):
     return {"status": "grading started", "submission_id": submission_id}
 
 
+import re as _re_global
+
+_RFC1123_RE_STR = r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
+
+
+def _to_rfc1123_segment(s: str) -> str:
+    """Lowercase, replace non-[a-z0-9] runs with '-', strip edge hyphens."""
+    return _re_global.sub(r'^-+|-+$', '', _re_global.sub(r'[^a-z0-9]+', '-', s.lower()))
+
+
+def _is_tbd_activity_id(activity_id: str) -> bool:
+    """Return True if this is a temporary TBD activity ID (contains '-tbd-NNN' suffix)."""
+    return bool(_re_global.search(r'-tbd-\d{3}$', activity_id))
+
+
+def _generate_tbd_activity_id(base: str, db) -> str:
+    """
+    Given a base slug (name-year-semester), find the lowest available
+    base-tbd-NNN (001..999) that does not conflict with an existing activity_id.
+    """
+    for n in range(1, 1000):
+        candidate = f"{base}-tbd-{n:03d}"
+        if not db.query(Activity).filter(Activity.activity_id == candidate).first():
+            return candidate
+    raise HTTPException(status_code=500, detail="Could not generate a unique TBD activity ID")
+
+
 # ──────────────────────────────────────────────
 # Activity endpoints
 # ──────────────────────────────────────────────
 
 @app.post("/api/activity")
 async def create_or_update_activity(
-    activity_id: str = Form(...),
+    request: Request,
+    activity_id: str = Form(None),   # optional on create; required when updating
     activity_name: str = Form(...),
     enabled: bool = Form(True),
     task_graders: str = Form(None),
@@ -333,11 +362,14 @@ async def create_or_update_activity(
     semester: str = Form(None),
     db: Session = Depends(get_db),
 ):
+    instructor = require_instructor(request, db)
+
     activity = db.query(Activity).filter(
         Activity.activity_id == activity_id
-    ).first()
+    ).first() if activity_id else None
 
     if activity:
+        # 3g: activity_name CAN be updated; activity_id cannot (it's the PK)
         activity.activity_name = activity_name
         activity.enabled = enabled
         if task_graders is not None:
@@ -349,6 +381,22 @@ async def create_or_update_activity(
         if semester is not None:
             activity.semester = semester
     else:
+        # ── Generate activity_id if not supplied ──────────────────────
+        if not activity_id:
+            if year and semester and activity_name:
+                parts = [_to_rfc1123_segment(p)
+                         for p in [activity_name, str(year), semester] if p]
+                parts = [p for p in parts if p]
+                base = '-'.join(parts)
+            else:
+                base = _to_rfc1123_segment(activity_name) if activity_name else "activity"
+            # No roster → TBD section placeholder (1b)
+            activity_id = _generate_tbd_activity_id(base, db)
+        elif not _re_global.match(_RFC1123_RE_STR, activity_id):
+            raise HTTPException(
+                status_code=422,
+                detail=f"activity_id '{activity_id}' does not meet RFC 1123 rules.",
+            )
         activity = Activity(
             activity_id=activity_id,
             activity_name=activity_name,
@@ -359,9 +407,23 @@ async def create_or_update_activity(
             semester=semester,
         )
         db.add(activity)
+        db.flush()  # ensure activity.activity_id is set before appending
+
+    # Link activity to this instructor (idempotent)
+    if activity not in instructor.activities:
+        instructor.activities.append(activity)
 
     db.commit()
     return {"status": "ok", "activity_id": activity_id}
+
+
+@app.get("/api/activity/{activity_id}/exists")
+async def activity_id_exists(activity_id: str, db: Session = Depends(get_db)):
+    """Return {"exists": true/false} for the given activity_id. Used by the GUI."""
+    exists = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first() is not None
+    return {"exists": exists}
 
 
 @app.delete("/api/activity/{activity_id}")
@@ -405,6 +467,56 @@ async def delete_activity(
     db.delete(activity)
     db.commit()
     return {"status": "deleted", "activity_id": activity_id}
+
+
+@app.patch("/api/activity/{activity_id}/enabled")
+async def toggle_activity_enabled(
+    activity_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Toggle the enabled flag on an activity. Body: {"enabled": true|false}"""
+    require_instructor(request, db)
+    activity = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+    body = await request.json()
+    activity.enabled = bool(body.get("enabled", not activity.enabled))
+    db.commit()
+    return {"status": "ok", "activity_id": activity_id, "enabled": activity.enabled}
+
+
+@app.post("/api/activity/{activity_id}/graders")
+async def set_activity_graders(
+    activity_id: str,
+    task_graders: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Set the task_graders directory path for an activity.
+
+    Does not require an instructor token — intended for server-side or
+    deployment scripts that configure grading after the activity is created.
+
+    Body (form):
+        task_graders  – absolute or relative path to the directory containing
+                        per-task grader scripts (grade_task1.py, grade_task2.py, …)
+    """
+    activity = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    activity.task_graders = task_graders
+    db.commit()
+    return {
+        "status":       "ok",
+        "activity_id":  activity_id,
+        "task_graders": activity.task_graders,
+    }
 
 
 @app.get("/api/activities")
@@ -553,40 +665,85 @@ async def upload_roster(
         )
 
     # ── Find or create the Activity ───────────────────────────────────
-    existing_activity = (
-        db.query(Activity)
-        .filter(
-            Activity.activity_name == activity_name,
-            Activity.section       == section,
-            Activity.year          == year,
-            Activity.semester      == semester,
+    existing_activity = None
+
+    # 1c: If a specific activity_id was passed and it's a TBD id, look it up directly
+    if activity_id and _is_tbd_activity_id(activity_id):
+        existing_activity = db.query(Activity).filter(
+            Activity.activity_id == activity_id
+        ).first()
+
+    # Otherwise search by (name, section, year, semester)
+    if not existing_activity:
+        existing_activity = (
+            db.query(Activity)
+            .filter(
+                Activity.activity_name == activity_name,
+                Activity.section       == section,
+                Activity.year          == year,
+                Activity.semester      == semester,
+            )
+            .first()
         )
-        .first()
-    )
+
+    # xd: If the found activity has a real (non-TBD) section, reject a mismatched section
+    if existing_activity and not _is_tbd_activity_id(existing_activity.activity_id):
+        if existing_activity.section and existing_activity.section != section:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Activity '{existing_activity.activity_id}' already has section "
+                    f"'{existing_activity.section}'. A roster with a different section "
+                    f"('{section}') may not be uploaded to it."
+                ),
+            )
 
     if existing_activity:
         activity = existing_activity
         is_new_activity = False
+
+        # 1c: Replace TBD activity_id with the real section-based id
+        if _is_tbd_activity_id(activity.activity_id):
+            import re as _re
+            def _to_seg(s):
+                return _re.sub(r'^-+|-+$', '', _re.sub(r'[^a-z0-9]+', '-', s.lower()))
+            parts = [_to_seg(p) for p in [activity_name, str(year), semester, section] if p]
+            new_id = '-'.join([p for p in parts if p])
+
+            # Validate and ensure uniqueness
+            if not _re.match(_RFC1123_RE_STR, new_id):
+                new_id = activity.activity_id  # keep TBD if something's wrong
+            elif db.query(Activity).filter(Activity.activity_id == new_id).first():
+                new_id = activity.activity_id  # already exists; keep TBD
+            else:
+                # Cascade update all FKs pointing to the old activity_id
+                old_id = activity.activity_id
+                db.query(UserActivity).filter(
+                    UserActivity.activity_id == old_id
+                ).update({"activity_id": new_id}, synchronize_session=False)
+                # Update the activity_instructors join table
+                from sqlalchemy import text as _text
+                db.execute(
+                    _text("UPDATE activity_instructors SET activity_id=:new WHERE activity_id=:old"),
+                    {"new": new_id, "old": old_id},
+                )
+                activity.activity_id = new_id
+                activity.section = section
+                db.flush()
+                activity_id = new_id
     else:
         # Derive an activity_id if one was not supplied.
         # Follows RFC 1123 subdomain rules: lowercase alphanumeric + hyphens,
         # must start and end with an alphanumeric character.
         if not activity_id:
-            import re as _re
-            def _to_rfc1123_segment(s: str) -> str:
-                """Lower-case s, replace non-[a-z0-9] runs with '-', strip edge hyphens."""
-                return _re.sub(r'^-+|-+$', '', _re.sub(r'[^a-z0-9]+', '-', s.lower()))
-
-            # Order: name - section - year - semester
+            # Order: name - year - semester - section
             parts = [_to_rfc1123_segment(p) for p in
-                     [activity_name, section, str(year), semester] if p]
+                     [activity_name, str(year), semester, section] if p]
             parts = [p for p in parts if p]   # drop any empty segments
             activity_id = '-'.join(parts)
 
         # Check the supplied activity_id isn't already in use by a different activity
-        import re as _re
-        _RFC1123_RE = r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$'
-        if not _re.match(_RFC1123_RE, activity_id):
+        if not _re_global.match(_RFC1123_RE_STR, activity_id):
             raise HTTPException(
                 status_code=422,
                 detail=(
@@ -649,6 +806,8 @@ async def upload_roster(
 
         first = row.get("First Name", "").strip()
         last  = row.get("Last Name",  "").strip()
+        sid   = row.get("SID", "").strip() or None
+
         if first and last:
             name = f"{first} {last}"
         elif first:
@@ -663,11 +822,18 @@ async def upload_roster(
         # Upsert user
         user = db.query(User).filter(User.email == email).first()
         if user:
-            # Update name only if the new name is non-empty and different
             if name and name != user.name:
                 user.name = name
+            if first:
+                user.first_name = first
+            if last:
+                user.last_name = last
+            if sid is not None:
+                user.user_id = sid
         else:
-            user = User(name=name, email=email)
+            user = User(name=name, email=email,
+                        first_name=first or None, last_name=last or None,
+                        user_id=sid)
             db.add(user)
             db.flush()
 
@@ -1029,11 +1195,106 @@ async def update_score(data: ScoreUpdate, db: Session = Depends(get_db)):
 # Download endpoints
 # ──────────────────────────────────────────────
 
+import csv as _csv
+import io as _io
+
+
+def _csv_val(v):
+    """Return empty string for None/falsy, otherwise the value as a string."""
+    if v is None:
+        return ""
+    return str(v)
+
+
+@app.get("/download-roster/{activity_id}")
+async def download_roster(activity_id: str, db: Session = Depends(get_db)):
+    """Download a CSV roster for an activity (5e).
+    Columns: First Name, Last Name, SID, Email, Role, Section"""
+    activity = db.query(Activity).filter(Activity.activity_id == activity_id).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    enrollments = (
+        db.query(UserActivity)
+        .filter(UserActivity.activity_id == activity_id)
+        .all()
+    )
+
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(["First Name", "Last Name", "SID", "Email", "Role", "Section"])
+    for ua in enrollments:
+        user = db.query(User).filter(User.id == ua.user_id).first()
+        if not user:
+            continue
+        writer.writerow([
+            _csv_val(user.first_name),
+            _csv_val(user.last_name),
+            _csv_val(user.user_id),
+            _csv_val(user.email),
+            _csv_val(ua.role),
+            _csv_val(activity.section),
+        ])
+
+    filename = f"roster_{activity_id}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue().encode("utf-8")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/download-scores/{activity_id}")
+async def download_scores(activity_id: str, db: Session = Depends(get_db)):
+    """Download a CSV of latest scores for an activity (5f).
+    Columns: First Name, Last Name, SID, Email, Role, Section, Score"""
+    activity = db.query(Activity).filter(Activity.activity_id == activity_id).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    enrollments = (
+        db.query(UserActivity)
+        .filter(UserActivity.activity_id == activity_id)
+        .all()
+    )
+
+    buf = _io.StringIO()
+    writer = _csv.writer(buf)
+    writer.writerow(["First Name", "Last Name", "SID", "Email", "Role", "Section", "Score"])
+    for ua in enrollments:
+        user = db.query(User).filter(User.id == ua.user_id).first()
+        if not user:
+            continue
+        latest = (
+            db.query(Submission)
+            .filter(Submission.user_activity_id == ua.id)
+            .order_by(Submission.submitted_at.desc())
+            .first()
+        )
+        score = _csv_val(latest.score if latest else None)
+        writer.writerow([
+            _csv_val(user.first_name),
+            _csv_val(user.last_name),
+            _csv_val(user.user_id),
+            _csv_val(user.email),
+            _csv_val(ua.role),
+            _csv_val(activity.section),
+            score,
+        ])
+
+    filename = f"scores_{activity_id}.csv"
+    return StreamingResponse(
+        iter([buf.getvalue().encode("utf-8")]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
 @app.get("/download/{activity_id}/{email:path}")
 async def download_notebook(
     activity_id: str,
     email: str,
     submission_id: int = None,
+    dl_name: str = None,
     db: Session = Depends(get_db),
 ):
     user = db.query(User).filter(User.email == email).first()
@@ -1063,8 +1324,11 @@ async def download_notebook(
     if not sub or not sub.notebook:
         raise HTTPException(status_code=404, detail="Notebook not found")
 
-    safe_email = email.replace("@", "_at_").replace(".", "_")
-    filename = sub.notebook_filename or f"{safe_email}_{activity_id}.ipynb"
+    if dl_name:
+        filename = dl_name if dl_name.endswith(".ipynb") else dl_name + ".ipynb"
+    else:
+        safe_email = email.replace("@", "_at_").replace(".", "_")
+        filename = sub.notebook_filename or f"{safe_email}_{activity_id}.ipynb"
     content = _to_bytes(sub.notebook)
     return StreamingResponse(
         iter([content]),
@@ -1078,6 +1342,7 @@ async def download_feedback(
     activity_id: str,
     email: str,
     submission_id: int = None,
+    dl_name: str = None,
     db: Session = Depends(get_db),
 ):
     user = db.query(User).filter(User.email == email).first()
@@ -1108,8 +1373,11 @@ async def download_feedback(
         raise HTTPException(status_code=404, detail="Submission not found")
 
     feedback_text = sub.feedback or "No feedback available."
-    safe_email = email.replace("@", "_at_").replace(".", "_")
-    filename = f"feedback_{safe_email}_{activity_id}.txt"
+    if dl_name:
+        filename = dl_name if dl_name.endswith(".txt") else dl_name + ".txt"
+    else:
+        safe_email = email.replace("@", "_at_").replace(".", "_")
+        filename = f"feedback_{safe_email}_{activity_id}.txt"
     return StreamingResponse(
         iter([feedback_text.encode()]),
         media_type="text/plain",
@@ -1268,7 +1536,18 @@ DASHBOARD_CSS = """
   }
   .activity-card h2 .h2-title { flex: 1; }
 
-  /* ── Update Roster button (per-card) ── */
+  /* ── Enable/Disable toggle button (per-card) ── */
+  .btn-toggle-activity {
+    border: none; border-radius: 5px;
+    padding: 4px 11px; font-size: .78rem; font-weight: 600; cursor: pointer;
+    white-space: nowrap; transition: background .15s; flex-shrink: 0;
+  }
+  .btn-toggle-activity.enabled  { background: #1a73e8; color: white; }
+  .btn-toggle-activity.enabled:hover  { background: #1558b0; }
+  .btn-toggle-activity.disabled { background: #5f6368; color: white; }
+  .btn-toggle-activity.disabled:hover { background: #3c4043; }
+
+  /* ── Update Activity button (per-card) ── */
   .btn-update-roster {
     background: #137333; color: white; border: none; border-radius: 5px;
     padding: 4px 11px; font-size: .78rem; font-weight: 600; cursor: pointer;
@@ -1338,76 +1617,184 @@ DASHBOARD_CSS = """
 
 def _build_activity_cards(instructor, db) -> str:
     """Return the inner HTML for all activity cards belonging to an instructor."""
+    from datetime import datetime, timezone, timedelta
+
+    # ── Pittsburgh ET timezone (EST=UTC-5, EDT=UTC-4) ────────────────
+    now_utc = datetime.now(timezone.utc)
+
+    def _nth_sunday(year, month, n):
+        from calendar import monthrange
+        count, day = 0, 1
+        while day <= monthrange(year, month)[1]:
+            if datetime(year, month, day).weekday() == 6:
+                count += 1
+                if count == n:
+                    return day
+            day += 1
+        return day
+
+    yr = now_utc.year
+    dst_start = datetime(yr, 3,  _nth_sunday(yr, 3,  2), 2, tzinfo=timezone.utc) + timedelta(hours=5)
+    dst_end   = datetime(yr, 11, _nth_sunday(yr, 11, 1), 2, tzinfo=timezone.utc) + timedelta(hours=4)
+    is_dst   = dst_start <= now_utc < dst_end
+    et_zone  = timezone(timedelta(hours=-4 if is_dst else -5))
+    tz_label = "EDT" if is_dst else "EST"
+
+    def _fmt_et(ts_str):
+        if not ts_str:
+            return ""
+        try:
+            ts = ts_str.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(et_zone).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            return ts_str
+
     cards = ""
     for act in instructor.activities:
-        rows = ""
         enrollments = (
             db.query(UserActivity)
             .filter(UserActivity.activity_id == act.activity_id)
             .all()
         )
 
+        # Gather all enrolled users and their latest submission
+        user_rows       = []   # (user, ua, latest_sub|None, sub_count)
+        has_students    = False
+        any_submissions = False
+
         for ua in enrollments:
-            submissions = (
+            user = db.query(User).filter(User.id == ua.user_id).first()
+            if not user:
+                continue
+            if ua.role == "Student":
+                has_students = True
+            subs = (
                 db.query(Submission)
                 .filter(Submission.user_activity_id == ua.id)
                 .order_by(Submission.submitted_at.desc())
                 .all()
             )
-            if not submissions:
-                continue
+            latest = subs[0] if subs else None
+            if latest:
+                any_submissions = True
+            user_rows.append((user, ua, latest, len(subs)))
 
-            user = db.query(User).filter(User.id == ua.user_id).first()
-            user_email = user.email if user else "unknown"
+        # ── Table rows ────────────────────────────────────────────────
+        rows_html = ""
+        has_roster = bool(user_rows)   # any enrolled users = has roster
+        any_scores = any(
+            latest is not None and latest.score is not None
+            for _, _, latest, _ in user_rows
+        )
 
-            latest = submissions[0]
-            submission_count = len(submissions)
-
-            if latest.score is None:
-                score_cell = '<span class="badge-grading">Grading…</span>'
+        for user, ua, latest, sub_count in user_rows:
+            safe_dl = user.email.replace("@", "-at-")
+            if latest:
+                time_cell  = _fmt_et(latest.submitted_at)
+                count_cell = str(sub_count)
+                score_cell = (
+                    '<span class="badge-grading">Grading…</span>'
+                    if latest.score is None
+                    else f'<span class="badge-score">{latest.score:.2f}</span>'
+                )
+                nb_name = f"notebook_{act.activity_id}_{safe_dl}"
+                fb_name = f"feedback_{act.activity_id}_{safe_dl}"
+                dl_url  = (f"/download/{act.activity_id}/{user.email}"
+                           f"?submission_id={latest.id}&dl_name={nb_name}")
+                fb_url  = (f"/download-feedback/{act.activity_id}/{user.email}"
+                           f"?submission_id={latest.id}&dl_name={fb_name}")
+                fb_btn  = (
+                    f'<a class="btn btn-fb" href="{fb_url}">Feedback</a>'
+                    if latest.feedback
+                    else '<span style="color:#aaa;font-size:.8rem">—</span>'
+                )
+                actions = f'<a class="btn btn-dl" href="{dl_url}">Download</a>{fb_btn}'
             else:
-                score_cell = f'<span class="badge-score">{latest.score:.2f}</span>'
+                time_cell = count_cell = score_cell = actions = ""
 
-            dl_url = f"/download/{act.activity_id}/{user_email}?submission_id={latest.id}"
-            fb_url = f"/download-feedback/{act.activity_id}/{user_email}?submission_id={latest.id}"
-
-            feedback_btn = (
-                f'<a class="btn btn-fb" href="{fb_url}">Feedback</a>'
-                if latest.feedback
-                else '<span style="color:#aaa;font-size:.8rem">—</span>'
-            )
-
-            rows += f"""
+            rows_html += f"""
             <tr>
-              <td>{user_email}</td>
-              <td>{submission_count}</td>
-              <td>{latest.submitted_at or ''}</td>
+              <td>{user.email}</td>
+              <td>{count_cell}</td>
+              <td>{time_cell}</td>
               <td>{score_cell}</td>
-              <td>
-                <a class="btn btn-dl" href="{dl_url}">Download</a>
-                {feedback_btn}
-              </td>
+              <td>{actions}</td>
             </tr>"""
 
+        # ── Download Roster / Scores row (items 2, 3, 4) ─────────────
+        # Roster button: only when there are enrolled users (item 3)
+        # Scores button: only when there are actual numeric scores (item 4)
+        # Both in the same row; Scores sits in the Latest Score column (item 2)
+        roster_dl_btn = (
+            f'<a class="btn btn-dl" href="/download-roster/{act.activity_id}">⬇ Download Roster</a>'
+            if has_roster else ""
+        )
+        scores_dl_btn = (
+            f'<a class="btn btn-dl" href="/download-scores/{act.activity_id}">⬇ Download Scores</a>'
+            if any_scores else ""
+        )
+        if roster_dl_btn or scores_dl_btn:
+            rows_html += f"""
+            <tr>
+              <td>{roster_dl_btn}</td>
+              <td></td><td></td>
+              <td>{scores_dl_btn}</td>
+              <td></td>
+            </tr>"""
+
+        # Issue 1: show activity even with no enrollments
+        if not rows_html:
+            rows_html = '<tr><td colspan="5" style="color:#aaa">No users enrolled</td></tr>'
+
+        # ── Card metadata ─────────────────────────────────────────────
         meta_parts = []
         if act.section:  meta_parts.append(f"Section {act.section}")
         if act.semester: meta_parts.append(act.semester)
         if act.year:     meta_parts.append(str(act.year))
-        meta_str = " · ".join(meta_parts)
+        meta_str  = " · ".join(meta_parts)
         meta_html = f'<span class="activity-meta">{meta_str}</span>' if meta_str else ""
 
-        # Escape activity_id for safe use in JS string (single-quoted)
-        safe_act_id = act.activity_id.replace("'", "\\'")
+        safe_act_id   = act.activity_id.replace("'", "\\'")
+        safe_act_name = act.activity_name.replace("'", "\\'").replace("\\", "\\\\")
+        safe_semester = (act.semester or "").replace("'", "\\'")
+        act_year      = act.year or ""
+
+        # 4/5a: blue=Enable, grey=Disable
+        if act.enabled:
+            toggle_cls   = "btn-toggle-activity disabled"
+            toggle_label = "Disable"
+            toggle_title = "Click to disable this activity"
+        else:
+            toggle_cls   = "btn-toggle-activity enabled"
+            toggle_label = "Enable"
+            toggle_title = "Click to enable this activity"
+
+        disabled_badge = (
+            "" if act.enabled
+            else ' <span style="background:#e8eaed;color:#5f6368;font-size:.72rem;'
+                 'font-weight:600;padding:1px 7px;border-radius:10px;vertical-align:middle">'
+                 'DISABLED</span>'
+        )
+
+        # 3b: roster button label
+        roster_btn_lbl = "Update Roster" if has_students else "Add Roster"
 
         cards += f"""
         <div class="activity-card">
           <h2>
-            <span class="h2-title">{act.activity_name}{meta_html}
+            <span class="h2-title">{act.activity_name}{disabled_badge}{meta_html}
               <small style="color:#bbb;font-size:.75rem;margin-left:6px">({act.activity_id})</small>
             </span>
+            <button class="{toggle_cls}" title="{toggle_title}"
+                    onclick="toggleActivity('{safe_act_id}', {str(act.enabled).lower()}, this)">
+              {toggle_label}
+            </button>
             <button class="btn-update-roster"
-                    onclick="document.getElementById('ur-input-{act.activity_id}').click()">
-              ↺ Update Roster
+                    onclick="openUpdateModal({{activity_id:'{safe_act_id}',activity_name:'{safe_act_name}',year:'{act_year}',semester:'{safe_semester}',enabled:{str(act.enabled).lower()},has_students:{str(has_students).lower()}}})">
+              ↺ Update Activity
             </button>
             <input type="file" id="ur-input-{act.activity_id}"
                    accept=".csv,text/csv" style="display:none"
@@ -1420,12 +1807,12 @@ def _build_activity_cards(instructor, db) -> str:
           <table>
             <thead>
               <tr>
-                <th>Email</th>
-                <th>Submissions</th><th>Latest Submitted</th>
+                <th>Email</th><th>Submissions</th>
+                <th>Latest Submission ({tz_label})</th>
                 <th>Latest Score</th><th>Actions</th>
               </tr>
             </thead>
-            <tbody>{rows or '<tr><td colspan="5" style="color:#aaa">No submissions yet</td></tr>'}</tbody>
+            <tbody>{rows_html}</tbody>
           </table>
         </div>"""
 
@@ -1455,6 +1842,12 @@ function toRFC1123Segment(str) {
     .replace(/^-+|-+$/g, '');
 }
 
+/**
+ * Auto-generate activity_id from: name – year – semester – section.
+ * When no section is available (no roster chosen yet), the section
+ * component is replaced by tbd-NNN (1b).  The server assigns the
+ * actual NNN; the browser just shows a preview with tbd-xxx.
+ */
 function buildAutoId() {
   const name     = document.getElementById('f-activity-name').value.trim();
   const year     = document.getElementById('f-year').value.trim();
@@ -1463,50 +1856,175 @@ function buildAutoId() {
 
   if (!name || !year || !semester) return '';
 
-  const rawParts = section
-    ? [name, section, year, semester]
-    : [name, year, semester];
+  // Order: name - year - semester - section  (3e/3f)
+  // If no section yet, use tbd-xxx as a preview placeholder
+  const sectionSlug = section ? toRFC1123Segment(section) : 'tbd-xxx';
+  const parts = [name, year, semester].map(toRFC1123Segment).filter(Boolean);
+  parts.push(sectionSlug);
+  if (parts.some(p => !p)) return '';
 
-  const parts = rawParts.map(toRFC1123Segment).filter(Boolean);
-  if (parts.length < (section ? 4 : 3)) return '';
-
-  const candidate = parts.join('-');
-  return RFC1123_RE.test(candidate) ? candidate : '';
+  return parts.join('-');
 }
 
 // ── Activity-ID live update & validation ─────────────────────────────
 
 function updateActivityId() {
   const idField = document.getElementById('f-activity-id');
-  if (idField.dataset.manual === 'true') return;
+  // Never overwrite when: user manually edited, OR we are in update mode (locked)
+  if (idField.dataset.manual === 'true' || idField.readOnly) return;
   const auto = buildAutoId();
   idField.value = auto;
-  refreshIdBadge(auto);
+  refreshIdBadge(auto, null);
 }
 
+// Debounce timer for the uniqueness check
+let _idCheckTimer = null;
+
 function onActivityIdInput(input) {
+  if (input.readOnly) return;  // locked in update mode
   const pos = input.selectionStart;
   input.value = input.value.toLowerCase();
   input.setSelectionRange(pos, pos);
   input.dataset.manual = input.value !== '' ? 'true' : 'false';
-  refreshIdBadge(input.value);
+
+  const val = input.value;
+  if (!val || val.includes('tbd-xxx')) {
+    refreshIdBadge(val, null);
+    return;
+  }
+  if (!RFC1123_RE.test(val)) {
+    refreshIdBadge(val, null);   // show invalid format immediately
+    return;
+  }
+  // Valid format: debounce a uniqueness check
+  clearTimeout(_idCheckTimer);
+  refreshIdBadge(val, 'checking');
+  _idCheckTimer = setTimeout(() => _checkIdUnique(val), 400);
 }
 
-function refreshIdBadge(value) {
+async function _checkIdUnique(val) {
+  // Only act if the field still holds this value
+  const field = document.getElementById('f-activity-id');
+  if (field.value !== val) return;
+  try {
+    const resp = await fetch('/api/activity/' + encodeURIComponent(val) + '/exists');
+    const data = await resp.json().catch(() => ({}));
+    if (field.value !== val) return;  // user typed again
+    refreshIdBadge(val, data.exists ? 'taken' : 'free');
+  } catch (_) {
+    refreshIdBadge(val, null);  // network error: fall back to format-only
+  }
+}
+
+/**
+ * Update the Activity ID validation badge.
+ * state: null = format-only, 'checking' = spinner, 'free' = unique, 'taken' = duplicate
+ */
+function refreshIdBadge(value, state) {
   const badge = document.getElementById('id-valid-badge');
-  if (!value) { badge.style.display = 'none'; return; }
-  const ok = RFC1123_RE.test(value);
-  badge.style.display    = 'inline';
-  badge.textContent      = ok ? '\u2713 valid' : '\u2717 invalid format';
-  badge.style.background = ok ? '#e6f4ea' : '#fce8e6';
-  badge.style.color      = ok ? '#137333' : '#c5221f';
+  if (!value || value.includes('tbd-xxx')) { badge.style.display = 'none'; return; }
+  const fmtOk = RFC1123_RE.test(value);
+  badge.style.display = 'inline';
+  if (!fmtOk) {
+    badge.textContent      = '\u2717 invalid format';
+    badge.style.background = '#fce8e6';
+    badge.style.color      = '#c5221f';
+  } else if (state === 'checking') {
+    badge.textContent      = '\u29d6 checking\u2026';
+    badge.style.background = '#e8f0fe';
+    badge.style.color      = '#1a73e8';
+  } else if (state === 'taken') {
+    badge.textContent      = '\u2717 already in use';
+    badge.style.background = '#fce8e6';
+    badge.style.color      = '#c5221f';
+  } else if (state === 'free') {
+    badge.textContent      = '\u2713 valid and available';
+    badge.style.background = '#e6f4ea';
+    badge.style.color      = '#137333';
+  } else {
+    // format valid, uniqueness unknown
+    badge.textContent      = '\u2713 valid format';
+    badge.style.background = '#e6f4ea';
+    badge.style.color      = '#137333';
+  }
 }
 
-// ── Add-Activity modal open / close ──────────────────────────────────
+// ── Modal open / close ───────────────────────────────────────────────
 
+/**
+ * Open in "Add" mode (new activity).
+ */
 function openModal() {
-  document.getElementById('modal-overlay').classList.add('open');
+  _openActivityModal({ mode: 'add' });
+}
+
+/**
+ * Open in "Update" mode for an existing activity.
+ * activityData = { activity_id, activity_name, year, semester, enabled, has_students }
+ */
+function openUpdateModal(activityData) {
+  _openActivityModal({ mode: 'update', data: activityData });
+}
+
+function _openActivityModal(opts) {
+  const isUpdate = opts.mode === 'update';
+  const data     = opts.data || {};
+
   resetModal();
+
+  // Update modal title
+  document.getElementById('modal-title').textContent =
+    isUpdate ? 'Update Activity' : 'Add Activity';
+
+  if (isUpdate) {
+    // Set roster button label (3b)
+    const rosterBtn = document.getElementById('roster-btn');
+    if (rosterBtn) {
+      rosterBtn.textContent = data.has_students ? 'Update Roster' : 'Add Roster';
+    }
+    // Pre-fill fields
+    document.getElementById('f-activity-name').value = data.activity_name || '';
+    document.getElementById('f-year').value           = data.year          || '';
+    const semSel = document.getElementById('f-semester');
+    Array.from(semSel.options).forEach(o => { o.selected = (o.value === data.semester); });
+    semSel.dispatchEvent(new Event('change'));   // trigger auto-ID (will be ignored due to readOnly)
+
+    // Lock/unlock the activity_id field depending on TBD status (xd / 3g)
+    const idField = document.getElementById('f-activity-id');
+    idField.value = data.activity_id || '';
+    const isTbd = (data.activity_id || '').includes('-tbd-');
+    if (isTbd) {
+      // TBD id: editable so instructor can override, but show note
+      idField.readOnly = false;
+      idField.style.background = '';
+      idField.style.color      = '';
+      idField.dataset.manual   = 'false';
+      document.getElementById('id-optional-label').style.display = 'inline';
+      document.getElementById('id-locked-label').style.display   = 'none';
+    } else {
+      // Real section id: fully locked
+      idField.readOnly = true;
+      idField.style.background = '#f8f9fa';
+      idField.style.color      = '#5f6368';
+      document.getElementById('id-optional-label').style.display = 'none';
+      document.getElementById('id-locked-label').style.display   = 'inline';
+    }
+    document.getElementById('id-valid-badge').style.display = 'none';
+
+    // Set enabled radio
+    const enabledVal = (data.enabled === true || data.enabled === 'true') ? 'true' : 'false';
+    document.querySelectorAll('input[name="f-enabled"]').forEach(r => {
+      r.checked = (r.value === enabledVal);
+    });
+
+
+    // Store the activity_id being updated
+    document.getElementById('modal-overlay').dataset.activityId = data.activity_id;
+  } else {
+    document.getElementById('modal-overlay').removeAttribute('data-activity-id');
+  }
+
+  document.getElementById('modal-overlay').classList.add('open');
   document.getElementById('f-activity-name').focus();
 }
 
@@ -1528,19 +2046,32 @@ document.addEventListener('keydown', function(e) {
   el.addEventListener(evt, updateActivityId);
 });
 
-// ── Add-Activity modal helpers ────────────────────────────────────────
+// ── Modal helpers ────────────────────────────────────────────────────
 
 function resetModal() {
   document.getElementById('f-activity-name').value = '';
   document.getElementById('f-year').value           = '';
   document.getElementById('f-semester').value       = '';
+
   const idField = document.getElementById('f-activity-id');
-  idField.value          = '';
-  idField.dataset.manual = 'false';
-  document.getElementById('id-valid-badge').style.display  = 'none';
-  document.getElementById('f-roster').value                = '';
-  document.getElementById('file-name-display').textContent = 'No file chosen';
-  window._rosterSection = '';
+  idField.value            = '';
+  idField.readOnly         = false;
+  idField.style.background = '';
+  idField.style.color      = '';
+  idField.dataset.manual   = 'false';
+
+  document.getElementById('id-optional-label').style.display = 'inline';
+  document.getElementById('id-locked-label').style.display   = 'none';
+  document.getElementById('id-valid-badge').style.display    = 'none';
+
+  // Reset enabled radio to "Enable" (default)
+  document.getElementById('f-enabled-yes').checked = true;
+
+  document.getElementById('f-roster').value  = '';
+  document.getElementById('file-name-display').textContent = '';
+  const rosterBtn = document.getElementById('roster-btn');
+  if (rosterBtn) rosterBtn.textContent = 'Add Roster';
+  window._rosterSection   = '';
   hideError();
   hideSuccess();
   setLoading(false);
@@ -1583,11 +2114,11 @@ function onFileChosen(input) {
   const reader = new FileReader();
   reader.onload = function(e) {
     try {
-      const text    = e.target.result;
-      const lines   = text.split(/\r?\n/).filter(l => l.trim());
+      const text     = e.target.result;
+      const lines    = text.replace(/\r/g, '').split('\n').filter(l => l.trim());
       if (lines.length < 2) { updateActivityId(); return; }
-      const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-      const secIdx  = headers.findIndex(h => h.toLowerCase() === 'section');
+      const headers  = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+      const secIdx   = headers.findIndex(h => h.toLowerCase() === 'section');
       if (secIdx === -1) { updateActivityId(); return; }
       const firstRow = lines[1].split(',').map(c => c.trim().replace(/^"|"$/g, ''));
       window._rosterSection = firstRow[secIdx] || '';
@@ -1599,22 +2130,25 @@ function onFileChosen(input) {
   reader.readAsText(input.files[0]);
 }
 
-// ── Add-Activity submit ───────────────────────────────────────────────
 
-async function submitRoster() {
+// ── Submit (Add / Update Activity) ────────────────────────────────────
+
+async function submitActivity() {
   hideError();
   hideSuccess();
 
-  const activityName = document.getElementById('f-activity-name').value.trim();
-  const year         = document.getElementById('f-year').value.trim();
-  const semester     = document.getElementById('f-semester').value;
-  const activityId   = document.getElementById('f-activity-id').value.trim();
-  const rosterInput  = document.getElementById('f-roster');
+  const activityName  = document.getElementById('f-activity-name').value.trim();
+  const year          = document.getElementById('f-year').value.trim();
+  const semester      = document.getElementById('f-semester').value;
+  const activityId    = document.getElementById('f-activity-id').value.trim();
+  const rosterInput   = document.getElementById('f-roster');
+  const enabledRadio  = document.querySelector('input[name="f-enabled"]:checked');
+  const enabled       = enabledRadio ? enabledRadio.value === 'true' : true;
+  const isUpdate      = !!document.getElementById('modal-overlay').dataset.activityId;
 
-  if (!activityName)             { showError('Activity Name is required.'); return; }
-  if (!year)                     { showError('Year is required.'); return; }
-  if (!semester)                 { showError('Semester is required.'); return; }
-  if (!rosterInput.files.length) { showError('Please choose a roster CSV file.'); return; }
+  if (!activityName) { showError('Activity Name is required.'); return; }
+  if (!year)         { showError('Year is required.'); return; }
+  if (!semester)     { showError('Semester is required.'); return; }
 
   const yearInt = parseInt(year, 10);
   if (isNaN(yearInt) || yearInt < 2000 || yearInt > 2099) {
@@ -1622,59 +2156,157 @@ async function submitRoster() {
     return;
   }
 
-  if (activityId && !RFC1123_RE.test(activityId)) {
+  // Activity ID validation only on create (it's locked on update).
+  // Skip validation for tbd-xxx preview strings (server will resolve them).
+  const idLooksTbd = activityId.includes('-tbd-') || activityId.endsWith('-tbd');
+  if (!isUpdate && activityId && !idLooksTbd && !RFC1123_RE.test(activityId)) {
     showError(
-      'Activity ID has an invalid format.\n' +
-      'Use only lowercase letters, digits, hyphens (-) and dots (.).\n' +
-      'Must start and end with a letter or digit.\n' +
-      'Example: intro-to-ai-11637-b-2024-fall'
+      'Activity ID has an invalid format.\\n' +
+      'Use only lowercase letters, digits, hyphens (-) and dots (.).\\n' +
+      'Must start and end with a letter or digit.\\n' +
+      'Example: intro-to-ai-2026-fall-11637-b'
     );
     return;
   }
 
+  // Block if activity_id is manually set and already taken (issue 5)
+  if (!isUpdate && activityId && !idLooksTbd) {
+    const badge = document.getElementById('id-valid-badge');
+    if (badge && badge.textContent.includes('already in use')) {
+      showError('That Activity ID is already in use. Please choose a different one.');
+      return;
+    }
+  }
+
   setLoading(true);
 
-  const fd = new FormData();
-  fd.append('activity_name',    activityName);
-  fd.append('year',             String(yearInt));
-  fd.append('semester',         semester);
-  fd.append('instructor_email', INSTRUCTOR_EMAIL);
-  fd.append('roster',           rosterInput.files[0]);
-  if (activityId) fd.append('activity_id', activityId);
+  // ── If a roster is present, use the roster endpoint ──────────────
+  if (rosterInput.files.length) {
+    const fd = new FormData();
+    fd.append('activity_name',    activityName);
+    fd.append('year',             String(yearInt));
+    fd.append('semester',         semester);
+    fd.append('instructor_email', INSTRUCTOR_EMAIL);
+    fd.append('roster',           rosterInput.files[0]);
+    // Pass existing id when updating (especially TBD ids needing section upgrade, 1c)
+    if (isUpdate) {
+      const existingId = document.getElementById('modal-overlay').dataset.activityId;
+      fd.append('activity_id', existingId);
+    } else if (activityId && !activityId.includes('tbd-xxx')) {
+      fd.append('activity_id', activityId);
+    }
 
-  try {
-    const resp = await fetch('/api/activity/roster', {
-      method:  'POST',
-      headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
-      body:    fd,
-    });
-
-    const data = await resp.json().catch(() => ({}));
-
-    if (!resp.ok) {
-      showError(typeof data.detail === 'string'
-        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
+    try {
+      const resp = await fetch('/api/activity/roster', {
+        method:  'POST',
+        headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+        body:    fd,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showError(typeof data.detail === 'string'
+          ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
+        setLoading(false);
+        return;
+      }
+      // After roster upload, also patch enabled + activity_name
+      const resolvedId = data.activity_id;
+      await _patchActivityMeta(resolvedId, activityName, enabled);
+      const label = data.is_new_activity ? 'created' : 'updated';
+      showSuccess('Activity "' + data.activity_name + '" ' + label + ' \u00b7 '
+        + data.enrolled_count + ' enrolled, ' + data.skipped_count + ' updated.');
+    } catch (err) {
+      showError('Network error: ' + err.message);
       setLoading(false);
       return;
     }
+  } else {
+    // ── No roster: create/update the activity record directly ────────
+    const fd = new FormData();
+    fd.append('activity_name', activityName);
+    fd.append('year',          String(yearInt));
+    fd.append('semester',      semester);
+    fd.append('enabled',       String(enabled));
+    // Always send activity_id when updating; on create only if manually set
+    if (isUpdate) {
+      const existingId = document.getElementById('modal-overlay').dataset.activityId;
+      fd.append('activity_id', existingId);
+    } else if (activityId && !activityId.includes('tbd-xxx')) {
+      fd.append('activity_id', activityId);
+    }
 
-    const label = data.is_new_activity ? 'created' : 'updated';
-    showSuccess(
-      'Activity "' + data.activity_name + '" ' + label + ' \u00b7 ' +
-      data.enrolled_count + ' enrolled, ' + data.skipped_count + ' updated.'
-    );
-    setTimeout(async () => {
-      closeModal();
-      await refreshActivities();
-    }, 1200);
+    try {
+      const resp = await fetch('/api/activity', {
+        method:  'POST',
+        headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+        body:    fd,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        showError(typeof data.detail === 'string'
+          ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status));
+        setLoading(false);
+        return;
+      }
+      showSuccess('Activity "' + activityName + '" ' + (isUpdate ? 'updated' : 'created') + '.');
+    } catch (err) {
+      showError('Network error: ' + err.message);
+      setLoading(false);
+      return;
+    }
+  }
+
+  setTimeout(async () => {
+    closeModal();
+    await refreshActivities();
+  }, 1200);
+}
+
+/** PATCH activity_name + enabled on an existing activity. */
+async function _patchActivityMeta(activityId, activityName, enabled) {
+  const fd = new FormData();
+  fd.append('activity_id',   activityId);
+  fd.append('activity_name', activityName);
+  fd.append('enabled',       String(enabled));
+  await fetch('/api/activity', {
+    method:  'POST',
+    headers: { 'Authorization': 'Bearer ' + BEARER_TOKEN },
+    body:    fd,
+  });
+}
+
+// ── Enable/Disable toggle (per-card) ─────────────────────────────────
+
+async function toggleActivity(activityId, currentEnabled, btn) {
+  const newEnabled = !currentEnabled;
+  btn.disabled = true;
+
+  try {
+    const resp = await fetch('/api/activity/' + encodeURIComponent(activityId) + '/enabled', {
+      method:  'PATCH',
+      headers: {
+        'Authorization': 'Bearer ' + BEARER_TOKEN,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({ enabled: newEnabled }),
+    });
+
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      alert('Toggle failed: ' + (data.detail || 'Server error ' + resp.status));
+      btn.disabled = false;
+      return;
+    }
+
+    await refreshActivities();
 
   } catch (err) {
-    showError('Network error: ' + err.message);
-    setLoading(false);
+    alert('Network error: ' + err.message);
+    btn.disabled = false;
   }
 }
 
-// ── Update Roster (per-card file input) ──────────────────────────────
+// ── Update Roster / Activity (per-card file input) ────────────────────
 
 async function onUpdateRosterChosen(input, activityId) {
   if (!input.files.length) return;
@@ -1701,7 +2333,7 @@ async function onUpdateRosterChosen(input, activityId) {
     if (!resp.ok) {
       const msg = typeof data.detail === 'string'
         ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status);
-      alert('Update Roster failed:\n\n' + msg);
+      alert('Update Activity failed:\\n\\n' + msg);
       btn.textContent = origLabel;
       btn.disabled    = false;
       input.value     = '';
@@ -1873,7 +2505,7 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
 </div>
 
 <!-- ═══════════════════════════════════════════
-     Add-Activity modal
+     Add / Update Activity modal
 ════════════════════════════════════════════ -->
 <div class="modal-overlay" id="modal-overlay" role="dialog"
      aria-modal="true" aria-labelledby="modal-title">
@@ -1899,7 +2531,7 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
       <div style="display:flex;gap:14px">
         <div class="field" style="flex:1">
           <label for="f-year">Year <span class="req">*</span></label>
-          <input type="number" id="f-year" placeholder="e.g. 2024" min="2000" max="2099">
+          <input type="number" id="f-year" placeholder="e.g. 2026" min="2000" max="2099">
         </div>
         <div class="field" style="flex:1">
           <label for="f-semester">Semester <span class="req">*</span></label>
@@ -1919,10 +2551,44 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
                style="background:#f8f9fa;color:#555">
       </div>
 
-      <!-- Activity ID (optional, auto-generated, RFC 1123 subdomain) -->
+      <!-- Enable / Disable radio -->
+      <div class="field">
+        <label>Status <span class="req">*</span></label>
+        <div style="display:flex;gap:20px;margin-top:4px">
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="radio" name="f-enabled" id="f-enabled-yes" value="true" checked>
+            Enable
+          </label>
+          <label style="font-weight:400;display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="radio" name="f-enabled" id="f-enabled-no" value="false">
+            Disable
+          </label>
+        </div>
+      </div>
+
+      <!-- Roster file (optional) -->
+      <div class="field">
+        <label>Roster CSV <span style="color:#888;font-weight:400">(optional)</span></label>
+        <div class="file-row">
+          <button class="btn-browse" type="button" id="roster-btn"
+                  onclick="document.getElementById('f-roster').click()">
+            Add Roster
+          </button>
+          <input type="file" id="f-roster" accept=".csv,text/csv"
+                 onchange="onFileChosen(this)">
+          <span class="file-name" id="file-name-display"></span>
+        </div>
+        <div class="hint">
+          Expected columns: First Name, Last Name, SID, Email, Role, Section.
+          All rows must share a single Section value.
+        </div>
+      </div>
+
+      <!-- Activity ID — last field (1a); locked once a real section is set (xd) -->
       <div class="field">
         <label for="f-activity-id">Activity ID
-          <span style="color:#888;font-weight:400">(optional)</span>
+          <span id="id-optional-label" style="color:#888;font-weight:400">(optional)</span>
+          <span id="id-locked-label"   style="color:#888;font-weight:400;display:none">(locked — cannot change after creation)</span>
           <span id="id-valid-badge" style="display:none;margin-left:8px;font-size:.78rem;
                 font-weight:600;padding:1px 7px;border-radius:10px"></span>
         </label>
@@ -1930,36 +2596,24 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
                placeholder="Auto-generated from fields above"
                oninput="onActivityIdInput(this)">
         <div class="hint">
-          Auto-generated from Activity Name + Section + Year + Semester.
-          You may edit it manually. Must follow RFC&nbsp;1123 subdomain format:
+          Auto-generated from Activity Name + Year + Semester + Section.
+          Without a roster, the Section component is set to <code>tbd-###</code>
+          (a unique 3-digit placeholder) and will be updated automatically when a
+          roster is first added.<br>
+          You may edit it manually, but only during activity creation.
+          The Activity ID must follow RFC&nbsp;1123 subdomain format:
           lowercase letters, digits, <code>-</code>, and <code>.</code> only;
           must start and end with a letter or digit
-          (e.g.&nbsp;<code>intro-to-ai-11637-b-2024-fall</code>).
+          (e.g.&nbsp;<code>intro-to-ai-2026-fall-11637-b</code>).
         </div>
       </div>
 
-      <!-- Roster file -->
-      <div class="field">
-        <label>Roster CSV <span class="req">*</span></label>
-        <div class="file-row">
-          <button class="btn-browse" type="button" onclick="document.getElementById('f-roster').click()">
-            Add Roster
-          </button>
-          <input type="file" id="f-roster" accept=".csv,text/csv"
-                 onchange="onFileChosen(this)">
-          <span class="file-name" id="file-name-display">No file chosen</span>
-        </div>
-        <div class="hint">
-          Expected columns: First Name, Last Name, SID, Email, Role, Section.
-          All rows must share a single Section value.
-        </div>
-      </div>
     </div><!-- /modal-body -->
 
     <div class="modal-footer">
       <div class="spinner" id="spinner"></div>
       <button class="btn-secondary" onclick="closeModal()">Cancel</button>
-      <button class="btn-primary"   id="submit-btn" onclick="submitRoster()">Upload Roster</button>
+      <button class="btn-primary"   id="submit-btn" onclick="submitActivity()">Submit</button>
     </div>
 
   </div><!-- /modal -->
@@ -2114,6 +2768,8 @@ async def update_roster(
 
         first = row.get("First Name", "").strip()
         last  = row.get("Last Name",  "").strip()
+        sid   = row.get("SID", "").strip() or None
+
         if first and last:
             name = f"{first} {last}"
         elif first:
@@ -2130,8 +2786,16 @@ async def update_roster(
         if user:
             if name and name != user.name:
                 user.name = name
+            if first:
+                user.first_name = first
+            if last:
+                user.last_name = last
+            if sid is not None:
+                user.user_id = sid
         else:
-            user = User(name=name, email=email)
+            user = User(name=name, email=email,
+                        first_name=first or None, last_name=last or None,
+                        user_id=sid)
             db.add(user)
             db.flush()
 

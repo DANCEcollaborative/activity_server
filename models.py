@@ -46,10 +46,14 @@ class Activity(Base):
 class User(Base):
     __tablename__ = 'users'
 
-    id       = Column(Integer, primary_key=True, autoincrement=True)
-    username = Column(String, nullable=True)
-    name     = Column(String, nullable=False)
-    email    = Column(String, unique=True, nullable=False)
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    username   = Column(String, nullable=True)
+    name       = Column(String, nullable=False)
+    email      = Column(String, unique=True, nullable=False)
+    # Student/institutional ID (mapped from "SID" column in roster CSV)
+    user_id    = Column(String, nullable=True)
+    first_name = Column(String, nullable=True)
+    last_name  = Column(String, nullable=True)
 
     # One user → many activity enrollments
     activities = relationship('UserActivity', back_populates='user',
