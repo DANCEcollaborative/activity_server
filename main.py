@@ -717,33 +717,43 @@ async def upload_roster(
                 new_id = activity.activity_id  # already exists; keep TBD
             else:
                 # ── Upgrade TBD id to real section-based id ───────────
-                # PostgreSQL enforces FK constraints immediately, so we
-                # must update every table that references the old PK
-                # BEFORE changing the activities PK itself.
-                # We do everything via raw SQL to stay outside SQLAlchemy's
-                # ORM flush queue, which would try to UPDATE activities first.
+                # PostgreSQL enforces FK constraints per-statement (NOT
+                # DEFERRABLE by default). db.execute() normally triggers
+                # an ORM auto-flush first which tries to UPDATE activities,
+                # but that fails while activity_instructors still holds
+                # the old FK value.
+                #
+                # Fix: temporarily disable autoflush, expunge the dirty
+                # activity object so the ORM has nothing to flush, then
+                # run all three raw SQL statements in the correct order
+                # within the same session transaction:
+                #   1. user_activities       (child FK table)
+                #   2. activity_instructors  (child FK table)
+                #   3. activities            (parent PK — now safe)
                 old_id = activity.activity_id
                 from sqlalchemy import text as _text
 
-                # 1. Update child tables that FK → activities.activity_id
-                db.execute(
-                    _text("UPDATE user_activities SET activity_id=:new WHERE activity_id=:old"),
-                    {"new": new_id, "old": old_id},
-                )
-                db.execute(
-                    _text("UPDATE activity_instructors SET activity_id=:new WHERE activity_id=:old"),
-                    {"new": new_id, "old": old_id},
-                )
+                db.expunge(activity)  # remove dirty object from ORM identity map
 
-                # 2. Now update the activities PK and section
-                db.execute(
-                    _text("UPDATE activities SET activity_id=:new, section=:section WHERE activity_id=:old"),
-                    {"new": new_id, "section": section, "old": old_id},
-                )
+                with db.no_autoflush:
+                    db.execute(
+                        _text("UPDATE user_activities"
+                              " SET activity_id=:new WHERE activity_id=:old"),
+                        {"new": new_id, "old": old_id},
+                    )
+                    db.execute(
+                        _text("UPDATE activity_instructors"
+                              " SET activity_id=:new WHERE activity_id=:old"),
+                        {"new": new_id, "old": old_id},
+                    )
+                    db.execute(
+                        _text("UPDATE activities"
+                              " SET activity_id=:new, section=:section"
+                              " WHERE activity_id=:old"),
+                        {"new": new_id, "section": section, "old": old_id},
+                    )
 
-                # 3. Sync the in-memory object so the rest of the request
-                #    uses the correct id (expunge forces a fresh load)
-                db.expunge(activity)
+                # Reload the updated activity into the current session
                 activity = db.query(Activity).filter(
                     Activity.activity_id == new_id
                 ).first()
