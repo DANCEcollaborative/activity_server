@@ -717,27 +717,36 @@ async def upload_roster(
                 new_id = activity.activity_id  # already exists; keep TBD
             else:
                 # ── Upgrade TBD id to real section-based id ───────────
-                # ORDER MATTERS for FK constraints:
-                #   1. Update the activities PK first and flush so the new
-                #      activity_id exists in the table before any FK row
-                #      references it.
-                #   2. Then update child tables (user_activities,
-                #      activity_instructors) that have FKs pointing to it.
+                # PostgreSQL enforces FK constraints immediately, so we
+                # must update every table that references the old PK
+                # BEFORE changing the activities PK itself.
+                # We do everything via raw SQL to stay outside SQLAlchemy's
+                # ORM flush queue, which would try to UPDATE activities first.
                 old_id = activity.activity_id
-                activity.activity_id = new_id
-                activity.section = section
-                db.flush()   # PK now exists in activities ← FK rows can follow
-
-                db.query(UserActivity).filter(
-                    UserActivity.activity_id == old_id
-                ).update({"activity_id": new_id}, synchronize_session=False)
-
                 from sqlalchemy import text as _text
+
+                # 1. Update child tables that FK → activities.activity_id
+                db.execute(
+                    _text("UPDATE user_activities SET activity_id=:new WHERE activity_id=:old"),
+                    {"new": new_id, "old": old_id},
+                )
                 db.execute(
                     _text("UPDATE activity_instructors SET activity_id=:new WHERE activity_id=:old"),
                     {"new": new_id, "old": old_id},
                 )
-                db.flush()
+
+                # 2. Now update the activities PK and section
+                db.execute(
+                    _text("UPDATE activities SET activity_id=:new, section=:section WHERE activity_id=:old"),
+                    {"new": new_id, "section": section, "old": old_id},
+                )
+
+                # 3. Sync the in-memory object so the rest of the request
+                #    uses the correct id (expunge forces a fresh load)
+                db.expunge(activity)
+                activity = db.query(Activity).filter(
+                    Activity.activity_id == new_id
+                ).first()
                 activity_id = new_id
     else:
         # Derive an activity_id if one was not supplied.
