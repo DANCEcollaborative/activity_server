@@ -716,19 +716,27 @@ async def upload_roster(
             elif db.query(Activity).filter(Activity.activity_id == new_id).first():
                 new_id = activity.activity_id  # already exists; keep TBD
             else:
-                # Cascade update all FKs pointing to the old activity_id
+                # ── Upgrade TBD id to real section-based id ───────────
+                # ORDER MATTERS for FK constraints:
+                #   1. Update the activities PK first and flush so the new
+                #      activity_id exists in the table before any FK row
+                #      references it.
+                #   2. Then update child tables (user_activities,
+                #      activity_instructors) that have FKs pointing to it.
                 old_id = activity.activity_id
+                activity.activity_id = new_id
+                activity.section = section
+                db.flush()   # PK now exists in activities ← FK rows can follow
+
                 db.query(UserActivity).filter(
                     UserActivity.activity_id == old_id
                 ).update({"activity_id": new_id}, synchronize_session=False)
-                # Update the activity_instructors join table
+
                 from sqlalchemy import text as _text
                 db.execute(
                     _text("UPDATE activity_instructors SET activity_id=:new WHERE activity_id=:old"),
                     {"new": new_id, "old": old_id},
                 )
-                activity.activity_id = new_id
-                activity.section = section
                 db.flush()
                 activity_id = new_id
     else:
