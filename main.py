@@ -716,20 +716,48 @@ async def upload_roster(
             elif db.query(Activity).filter(Activity.activity_id == new_id).first():
                 new_id = activity.activity_id  # already exists; keep TBD
             else:
-                # Cascade update all FKs pointing to the old activity_id
+                # ── Upgrade TBD id to real section-based id ───────────
+                # The activity_instructors FK is NOT DEFERRABLE by default,
+                # so PostgreSQL checks it per-statement. We need to either:
+                #   (a) defer it within this transaction, or
+                #   (b) temporarily drop and recreate it.
+                # We use SET CONSTRAINTS DEFERRED so the FK is only checked
+                # at COMMIT, letting us update parent and children in any order
+                # within the same transaction.
                 old_id = activity.activity_id
-                db.query(UserActivity).filter(
-                    UserActivity.activity_id == old_id
-                ).update({"activity_id": new_id}, synchronize_session=False)
-                # Update the activity_instructors join table
                 from sqlalchemy import text as _text
-                db.execute(
-                    _text("UPDATE activity_instructors SET activity_id=:new WHERE activity_id=:old"),
-                    {"new": new_id, "old": old_id},
-                )
-                activity.activity_id = new_id
-                activity.section = section
-                db.flush()
+
+                # Expunge the ORM object so SQLAlchemy won't auto-flush it
+                db.expunge(activity)
+
+                with db.no_autoflush:
+                    # Defer FK checks until end of transaction
+                    db.execute(_text(
+                        "SET CONSTRAINTS activity_instructors_activity_id_fkey DEFERRED"
+                    ))
+
+                    # Now order doesn't matter — all constraints checked at commit
+                    db.execute(
+                        _text("UPDATE activities"
+                              " SET activity_id=:new, section=:section"
+                              " WHERE activity_id=:old"),
+                        {"new": new_id, "section": section, "old": old_id},
+                    )
+                    db.execute(
+                        _text("UPDATE user_activities"
+                              " SET activity_id=:new WHERE activity_id=:old"),
+                        {"new": new_id, "old": old_id},
+                    )
+                    db.execute(
+                        _text("UPDATE activity_instructors"
+                              " SET activity_id=:new WHERE activity_id=:old"),
+                        {"new": new_id, "old": old_id},
+                    )
+
+                # Reload the updated activity into the current session
+                activity = db.query(Activity).filter(
+                    Activity.activity_id == new_id
+                ).first()
                 activity_id = new_id
     else:
         # Derive an activity_id if one was not supplied.
