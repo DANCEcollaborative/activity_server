@@ -72,35 +72,88 @@ DATABASE_URL = os.getenv(
 )
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-Base.metadata.create_all(bind=engine)
+
+# Arbitrary fixed key for a Postgres session-level advisory lock (see
+# _run_startup_schema_setup below). Any two connections calling
+# pg_advisory_lock with the same integer key serialize against each
+# other; the value has no other meaning. manage.py uses this same
+# constant so a CLI invocation can't race the app's own startup either.
+_SCHEMA_SETUP_LOCK_KEY = 7451182300
 
 
-def _run_lightweight_migrations():
+def _add_column_if_missing(column_name: str, ddl: str):
     """
-    Idempotent, additive schema patches for columns introduced after the
-    original table definitions (the admin-account fields on instructors).
-    Safe to run on every startup, including against a database that
-    already has these columns. Uses inspect() rather than the Postgres-only
-    `ADD COLUMN IF NOT EXISTS` syntax so this also works against SQLite in
-    local/dev testing.
+    Idempotent: add a column to the instructors table only if it isn't
+    already there. Also tolerates a "column already exists" error as a
+    fallback in case it's ever called outside the advisory-lock guard
+    below (e.g. against a non-Postgres engine in local/dev testing).
     """
     from sqlalchemy import inspect as _inspect
     from sqlalchemy import text as _text
+    from sqlalchemy.exc import DBAPIError
 
     existing_cols = {c["name"] for c in _inspect(engine).get_columns("instructors")}
-    with engine.begin() as conn:
-        if "password_hash" not in existing_cols:
-            conn.execute(_text(
-                "ALTER TABLE instructors ADD COLUMN password_hash VARCHAR"
-            ))
-        if "is_admin" not in existing_cols:
-            conn.execute(_text(
-                "ALTER TABLE instructors ADD COLUMN is_admin "
-                "BOOLEAN NOT NULL DEFAULT FALSE"
-            ))
+    if column_name in existing_cols:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(_text(ddl))
+    except DBAPIError as exc:
+        msg = str(exc).lower()
+        if "already exists" in msg or "duplicate column" in msg:
+            logging.getLogger("grader").info(
+                f"[migrate] '{column_name}' already added by another "
+                f"process, ignoring: {exc}"
+            )
+        else:
+            raise
 
 
-_run_lightweight_migrations()
+def _run_startup_schema_setup():
+    """
+    Create tables (if missing) and apply lightweight additive column
+    migrations (the admin-account fields on instructors). Safe to run on
+    every startup, including against a database that already has
+    everything set up.
+
+    main.py is imported fresh by each uvicorn *worker process*
+    (docker-compose.yml runs `--workers 4`), so without care, up to 4
+    processes would run this at nearly the same instant — including on a
+    completely fresh database, where SQLAlchemy's create_all() and our
+    ALTER TABLE statements can both collide across processes (each one
+    checks "does this exist yet?", sees "no", and tries to create it, but
+    only the first to actually commit succeeds — the rest error out).
+
+    To avoid that, on Postgres this whole block is serialized with a
+    session-level advisory lock: one worker does the actual DDL while the
+    others block, then proceed and find everything already in place.
+    _add_column_if_missing()'s own "already exists" tolerance is kept as a
+    belt-and-suspenders fallback (e.g. if this is ever invoked outside a
+    single Postgres instance's coordination, such as manage.py running at
+    the same moment against the same database from a separate connection
+    pool). On non-Postgres engines (e.g. SQLite in local/dev testing,
+    where there's no multi-worker concurrency to guard against) it just
+    runs directly.
+    """
+    from sqlalchemy import text as _text
+
+    if engine.dialect.name != "postgresql":
+        Base.metadata.create_all(bind=engine)
+        _add_column_if_missing("password_hash", "ALTER TABLE instructors ADD COLUMN password_hash VARCHAR")
+        _add_column_if_missing("is_admin", "ALTER TABLE instructors ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE")
+        return
+
+    with engine.connect() as lock_conn:
+        lock_conn.execute(_text("SELECT pg_advisory_lock(:k)"), {"k": _SCHEMA_SETUP_LOCK_KEY})
+        try:
+            Base.metadata.create_all(bind=engine)
+            _add_column_if_missing("password_hash", "ALTER TABLE instructors ADD COLUMN password_hash VARCHAR")
+            _add_column_if_missing("is_admin", "ALTER TABLE instructors ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE")
+        finally:
+            lock_conn.execute(_text("SELECT pg_advisory_unlock(:k)"), {"k": _SCHEMA_SETUP_LOCK_KEY})
+
+
+_run_startup_schema_setup()
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 

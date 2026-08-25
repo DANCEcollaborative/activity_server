@@ -24,6 +24,7 @@ import os
 import sys
 
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 
 from auth_utils import hash_password
@@ -34,23 +35,58 @@ DATABASE_URL = os.getenv(
     "postgresql://activity_user:activity_pass@db:5432/activity_db",
 )
 
+# Must match main.py's _SCHEMA_SETUP_LOCK_KEY exactly: it's what stops this
+# script from racing the app container's own startup (e.g. running this
+# CLI at the same moment `docker compose up` is booting the app's 4
+# uvicorn workers) on schema creation/migration.
+_SCHEMA_SETUP_LOCK_KEY = 7451182300
+
+
+def _add_column_if_missing(engine, table: str, column_name: str, ddl: str):
+    """
+    Same idempotent, additive patch main.py applies at startup. Tolerates
+    a "column already exists" race as a belt-and-suspenders fallback —
+    the advisory lock in _get_session() below is what actually prevents
+    the race on Postgres.
+    """
+    existing_cols = {c["name"] for c in inspect(engine).get_columns(table)}
+    if column_name in existing_cols:
+        return
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+    except DBAPIError as exc:
+        msg = str(exc).lower()
+        if "already exists" not in msg and "duplicate column" not in msg:
+            raise
+
 
 def _get_session():
     engine = create_engine(DATABASE_URL)
-    Base.metadata.create_all(bind=engine)
-    # Same idempotent, additive patch main.py applies at startup — keeps
-    # this script usable even if it's ever run before the app container.
-    existing_cols = {c["name"] for c in inspect(engine).get_columns("instructors")}
-    with engine.begin() as conn:
-        if "password_hash" not in existing_cols:
-            conn.execute(text(
-                "ALTER TABLE instructors ADD COLUMN password_hash VARCHAR"
-            ))
-        if "is_admin" not in existing_cols:
-            conn.execute(text(
-                "ALTER TABLE instructors ADD COLUMN is_admin "
-                "BOOLEAN NOT NULL DEFAULT FALSE"
-            ))
+
+    def _create_and_migrate():
+        Base.metadata.create_all(bind=engine)
+        _add_column_if_missing(
+            engine, "instructors", "password_hash",
+            "ALTER TABLE instructors ADD COLUMN password_hash VARCHAR",
+        )
+        _add_column_if_missing(
+            engine, "instructors", "is_admin",
+            "ALTER TABLE instructors ADD COLUMN is_admin BOOLEAN NOT NULL DEFAULT FALSE",
+        )
+
+    if engine.dialect.name == "postgresql":
+        # Serialize against the app container's own startup schema setup
+        # (see main.py's _run_startup_schema_setup) so the two can't race.
+        with engine.connect() as lock_conn:
+            lock_conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _SCHEMA_SETUP_LOCK_KEY})
+            try:
+                _create_and_migrate()
+            finally:
+                lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _SCHEMA_SETUP_LOCK_KEY})
+    else:
+        _create_and_migrate()
+
     Session = sessionmaker(bind=engine)
     return Session()
 
