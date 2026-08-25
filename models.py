@@ -118,6 +118,12 @@ class Instructor(Base):
     id    = Column(Integer, primary_key=True, autoincrement=True)
     email = Column(String, unique=True, nullable=False)
     name  = Column(String, nullable=True)
+    # Password hash for the special 'admin' account (see auth_utils.py).
+    # Always NULL for ordinary Google-authenticated instructors.
+    password_hash = Column(String, nullable=True)
+    # True only for the administrative account that can view and manage
+    # activities across every instructor from the dashboard.
+    is_admin = Column(Boolean, default=False, nullable=False)
 
     activities = relationship('Activity', secondary=activity_instructors,
                               back_populates='instructors')

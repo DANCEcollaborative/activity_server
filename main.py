@@ -26,32 +26,41 @@ POST   /api/activity/roster             – upload a CSV roster to create/update
 POST   /api/activity/roster/update      – update enrollment for an existing activity from a new CSV roster
 POST   /api/activity/{activity_id}/graders  – set the task_graders directory path for an activity
 
-POST   /api/instructor                  – add instructor / assign activity
+POST   /api/instructor                  – add/update instructor, optionally assign an activity
+PUT    /api/activity/{activity_id}/instructor – reassign an activity's instructor
 
 GET    /download/{activity_id}/{email}  – download latest (or specific) notebook
 GET    /download-feedback/{activity_id}/{email} – download latest feedback
 
-GET    /dashboard                       – instructor dashboard (Google auth)
+GET    /dashboard                       – instructor dashboard (Google auth, or admin session)
+GET/POST /admin/login                   – password sign-in for the admin account
+GET    /admin/logout                    – clear the admin session
 """
 
 import asyncio
 import csv
+import hashlib
+import hmac
+import html
 import io
 import logging
 import os
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from typing import List, Optional
+from urllib.parse import quote as _url_quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from pydantic import BaseModel
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from auth_utils import verify_password
 from models import Activity, Base, Instructor, Submission, User, UserActivity
 
 # ──────────────────────────────────────────────
@@ -65,10 +74,74 @@ engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base.metadata.create_all(bind=engine)
 
+
+def _run_lightweight_migrations():
+    """
+    Idempotent, additive schema patches for columns introduced after the
+    original table definitions (the admin-account fields on instructors).
+    Safe to run on every startup, including against a database that
+    already has these columns. Uses inspect() rather than the Postgres-only
+    `ADD COLUMN IF NOT EXISTS` syntax so this also works against SQLite in
+    local/dev testing.
+    """
+    from sqlalchemy import inspect as _inspect
+    from sqlalchemy import text as _text
+
+    existing_cols = {c["name"] for c in _inspect(engine).get_columns("instructors")}
+    with engine.begin() as conn:
+        if "password_hash" not in existing_cols:
+            conn.execute(_text(
+                "ALTER TABLE instructors ADD COLUMN password_hash VARCHAR"
+            ))
+        if "is_admin" not in existing_cols:
+            conn.execute(_text(
+                "ALTER TABLE instructors ADD COLUMN is_admin "
+                "BOOLEAN NOT NULL DEFAULT FALSE"
+            ))
+
+
+_run_lightweight_migrations()
+
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
 app = FastAPI()
 logger = logging.getLogger("grader")
+
+# ── Admin session config ─────────────────────────────────────────────────
+# Signs short-lived admin session tokens: both the browser cookie set by
+# POST /admin/login and the Bearer token the dashboard JS sends back to the
+# API for an admin session. Set ADMIN_SESSION_SECRET in your .env file —
+# anyone who knows this value can mint an admin session.
+ADMIN_SESSION_SECRET = os.getenv("ADMIN_SESSION_SECRET", "insecure-default-change-me")
+ADMIN_SESSION_TTL_SECONDS = 12 * 60 * 60  # 12 hours
+
+if ADMIN_SESSION_SECRET == "insecure-default-change-me":
+    logger.warning(
+        "[admin] ADMIN_SESSION_SECRET is not set - using an insecure default. "
+        "Set ADMIN_SESSION_SECRET in your .env file before relying on the admin login."
+    )
+
+
+def _make_admin_token() -> str:
+    expiry = int(time.time()) + ADMIN_SESSION_TTL_SECONDS
+    msg = f"admin.{expiry}"
+    sig = hmac.new(ADMIN_SESSION_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return f"{msg}.{sig}"
+
+
+def _verify_admin_token(token: str) -> bool:
+    try:
+        prefix, expiry_str, sig = token.split(".")
+        if prefix != "admin":
+            return False
+        expiry = int(expiry_str)
+        if expiry < time.time():
+            return False
+        msg = f"admin.{expiry}"
+        expected = hmac.new(ADMIN_SESSION_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, sig)
+    except Exception:
+        return False
 
 
 # ──────────────────────────────────────────────
@@ -104,12 +177,29 @@ def verify_google_token(token: str) -> dict:
 
 
 def require_instructor(request: Request, db: Session) -> Instructor:
-    """Raise 401 / 403 if the request does not carry a valid instructor token."""
+    """
+    Raise 401 / 403 if the request does not carry a valid instructor or
+    admin token. Accepts two kinds of Bearer tokens:
+      • a Google ID token belonging to a row in the instructors table, or
+      • a signed admin-session token issued by POST /admin/login, which
+        resolves to the single instructors row with is_admin=True.
+    """
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing token")
     token = auth.split(" ", 1)[1]
-    claims = verify_google_token(token)
+
+    if _verify_admin_token(token):
+        admin = db.query(Instructor).filter(Instructor.is_admin.is_(True)).first()
+        if not admin:
+            raise HTTPException(status_code=403, detail="Admin account not configured")
+        return admin
+
+    try:
+        claims = verify_google_token(token)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}")
+
     email = claims.get("email", "")
     instructor = db.query(Instructor).filter(Instructor.email == email).first()
     if not instructor:
@@ -409,8 +499,9 @@ async def create_or_update_activity(
         db.add(activity)
         db.flush()  # ensure activity.activity_id is set before appending
 
-    # Link activity to this instructor (idempotent)
-    if activity not in instructor.activities:
+    # Link activity to this instructor (idempotent). Skip for the admin
+    # account, which manages activities without being a course instructor.
+    if not instructor.is_admin and activity not in instructor.activities:
         instructor.activities.append(activity)
 
     db.commit()
@@ -486,6 +577,70 @@ async def toggle_activity_enabled(
     activity.enabled = bool(body.get("enabled", not activity.enabled))
     db.commit()
     return {"status": "ok", "activity_id": activity_id, "enabled": activity.enabled}
+
+
+class InstructorChange(BaseModel):
+    instructor_email: str
+    instructor_name: str = None
+
+
+@app.put("/api/activity/{activity_id}/instructor")
+async def change_activity_instructor(
+    activity_id: str,
+    data: InstructorChange,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Reassign the instructor for an activity, replacing any existing
+    instructor assignment(s) with the single instructor given.
+
+    Callable by:
+      • the admin account (can reassign any activity), or
+      • an instructor already assigned to this activity (e.g. handing a
+        course off to someone else).
+
+    If no instructor record exists yet for the given email, one is
+    created automatically (mirrors POST /api/instructor).
+    """
+    requester = require_instructor(request, db)
+
+    activity = db.query(Activity).filter(
+        Activity.activity_id == activity_id
+    ).first()
+    if not activity:
+        raise HTTPException(status_code=404, detail="Activity not found")
+
+    if not requester.is_admin and activity not in requester.activities:
+        raise HTTPException(
+            status_code=403,
+            detail="You are not assigned to this activity",
+        )
+
+    new_email = data.instructor_email.strip()
+    if not new_email:
+        raise HTTPException(status_code=422, detail="instructor_email is required")
+
+    new_instructor = db.query(Instructor).filter(
+        Instructor.email == new_email
+    ).first()
+    if not new_instructor:
+        new_instructor = Instructor(email=new_email, name=data.instructor_name)
+        db.add(new_instructor)
+        db.flush()
+    elif data.instructor_name:
+        new_instructor.name = data.instructor_name
+
+    # Replace whichever instructor(s) were previously assigned.
+    activity.instructors = [new_instructor]
+    db.commit()
+
+    return {
+        "status": "ok",
+        "activity_id": activity_id,
+        "instructor_email": new_instructor.email,
+        "instructor_name": new_instructor.name,
+    }
 
 
 @app.post("/api/activity/{activity_id}/graders")
@@ -806,7 +961,9 @@ async def upload_roster(
         is_new_activity = True
 
     # ── Assign instructor to the activity ─────────────────────────────
-    if activity not in instructor.activities:
+    # Skip for the admin account, which manages rosters without being a
+    # course instructor itself.
+    if not instructor.is_admin and activity not in instructor.activities:
         instructor.activities.append(activity)
 
     # ── If updating an existing activity, drop Student enrollments ────
@@ -912,11 +1069,52 @@ async def upload_roster(
 class InstructorCreate(BaseModel):
     email: str
     name: str = None
-    activity_id: str
+    activity_id: str = None   # optional: omit to create a "bare" instructor
 
 
 @app.post("/api/instructor")
-async def add_instructor(data: InstructorCreate, db: Session = Depends(get_db)):
+async def add_instructor(
+    data: InstructorCreate,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Create (or update the display name of) an instructor account,
+    optionally assigning them to an activity.
+
+    Auth:
+      • Adding a *bare* instructor (activity_id omitted) — i.e.
+        provisioning a new person who can then sign in with Google and
+        create their own activities — requires the admin account.
+      • Adding activity_id to assign an *existing* activity to an
+        instructor requires either the admin account or an instructor
+        already assigned to that activity (adding a collaborator to
+        their own course).
+
+    NOTE: previously this endpoint had no auth check at all and
+    always required activity_id. Both have changed — update any
+    existing scripts that call it directly.
+    """
+    requester = require_instructor(request, db)
+
+    activity = None
+    if data.activity_id:
+        activity = db.query(Activity).filter(
+            Activity.activity_id == data.activity_id
+        ).first()
+        if not activity:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        if not requester.is_admin and activity not in requester.activities:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned to this activity",
+            )
+    elif not requester.is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the admin account can add an instructor with no activity",
+        )
+
     instructor = db.query(Instructor).filter(
         Instructor.email == data.email
     ).first()
@@ -927,17 +1125,11 @@ async def add_instructor(data: InstructorCreate, db: Session = Depends(get_db)):
     elif data.name:
         instructor.name = data.name
 
-    activity = db.query(Activity).filter(
-        Activity.activity_id == data.activity_id
-    ).first()
-    if not activity:
-        raise HTTPException(status_code=404, detail="Activity not found")
-
-    if activity not in instructor.activities:
+    if activity and activity not in instructor.activities:
         instructor.activities.append(activity)
 
     db.commit()
-    return {"status": "ok", "instructor_id": instructor.id}
+    return {"status": "ok", "instructor_id": instructor.id, "email": instructor.email}
 
 
 # ──────────────────────────────────────────────
@@ -1643,8 +1835,15 @@ DASHBOARD_CSS = """
 """
 
 
-def _build_activity_cards(instructor, db) -> str:
-    """Return the inner HTML for all activity cards belonging to an instructor."""
+def _build_activity_cards(activities, db, show_instructor_names: bool = False) -> str:
+    """
+    Return the inner HTML for a list of activity cards.
+
+    `activities` may be an instructor's `.activities` relationship (their
+    own courses) or, for the admin view, every Activity row in the system.
+    When `show_instructor_names` is True, each card also lists the
+    instructor(s) currently assigned to it.
+    """
     from datetime import datetime, timezone, timedelta
 
     # ── Pittsburgh ET timezone (EST=UTC-5, EDT=UTC-4) ────────────────
@@ -1681,7 +1880,7 @@ def _build_activity_cards(instructor, db) -> str:
             return ts_str
 
     cards = ""
-    for act in instructor.activities:
+    for act in activities:
         enrollments = (
             db.query(UserActivity)
             .filter(UserActivity.activity_id == act.activity_id)
@@ -1782,8 +1981,14 @@ def _build_activity_cards(instructor, db) -> str:
         if act.section:  meta_parts.append(f"Section {act.section}")
         if act.semester: meta_parts.append(act.semester)
         if act.year:     meta_parts.append(str(act.year))
+        if show_instructor_names:
+            instr_str = ", ".join(i.email for i in act.instructors) or "unassigned"
+            meta_parts.append(f"Instructor: {instr_str}")
         meta_str  = " · ".join(meta_parts)
         meta_html = f'<span class="activity-meta">{meta_str}</span>' if meta_str else ""
+
+        instr_list_str  = ", ".join(i.email for i in act.instructors) or "(none)"
+        safe_instr_list = instr_list_str.replace("'", "\\'").replace("\\", "\\\\")
 
         safe_act_id   = act.activity_id.replace("'", "\\'")
         safe_act_name = act.activity_name.replace("'", "\\'").replace("\\", "\\\\")
@@ -1827,6 +2032,10 @@ def _build_activity_cards(instructor, db) -> str:
             <input type="file" id="ur-input-{act.activity_id}"
                    accept=".csv,text/csv" style="display:none"
                    onchange="onUpdateRosterChosen(this, '{safe_act_id}')">
+            <button class="btn-toggle-activity enabled" style="background:#5f6368"
+                    onclick="openChangeInstructorModal('{safe_act_id}', '{safe_instr_list}')">
+              👤 Change Instructor
+            </button>
             <button class="btn-delete-activity"
                     onclick="openDeleteConfirm('{safe_act_id}')">
               🗑 Delete Activity
@@ -1844,7 +2053,13 @@ def _build_activity_cards(instructor, db) -> str:
           </table>
         </div>"""
 
-    return cards or "<p style='color:#888'>No activities assigned yet.</p>"
+    if cards:
+        return cards
+    return (
+        "<p style='color:#888'>No activities exist yet.</p>"
+        if show_instructor_names else
+        "<p style='color:#888'>No activities assigned yet.</p>"
+    )
 
 
 # Pre-built JS block for the instructor dashboard.
@@ -2065,7 +2280,7 @@ document.getElementById('modal-overlay').addEventListener('click', function(e) {
 });
 
 document.addEventListener('keydown', function(e) {
-  if (e.key === 'Escape') { closeModal(); closeDeleteConfirm(); }
+  if (e.key === 'Escape') { closeModal(); closeDeleteConfirm(); closeChangeInstructorModal(); closeAddInstructorModal(); }
 });
 
 ['f-activity-name', 'f-year', 'f-semester'].forEach(function(id) {
@@ -2455,6 +2670,137 @@ async function confirmDelete() {
     document.getElementById('btn-no-delete').disabled      = false;
     document.getElementById('del-spinner').style.display   = 'none';
   }
+}
+
+// ── Change Instructor ─────────────────────────────────────────────────
+
+let _ciActivityId = null;
+
+function openChangeInstructorModal(activityId, currentInstructors) {
+  _ciActivityId = activityId;
+  document.getElementById('ci-current').textContent = currentInstructors || '(none)';
+  document.getElementById('ci-email').value = '';
+  document.getElementById('ci-name').value  = '';
+  document.getElementById('ci-error-banner').classList.remove('visible');
+  document.getElementById('change-instructor-overlay').classList.add('open');
+  setTimeout(() => document.getElementById('ci-email').focus(), 50);
+}
+
+function closeChangeInstructorModal() {
+  document.getElementById('change-instructor-overlay').classList.remove('open');
+  _ciActivityId = null;
+}
+
+document.getElementById('change-instructor-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeChangeInstructorModal();
+});
+
+async function submitChangeInstructor() {
+  if (!_ciActivityId) return;
+  const email = document.getElementById('ci-email').value.trim();
+  const name  = document.getElementById('ci-name').value.trim();
+  const errEl = document.getElementById('ci-error-banner');
+  errEl.classList.remove('visible');
+
+  if (!email) {
+    errEl.textContent = 'Instructor email is required.';
+    errEl.classList.add('visible');
+    return;
+  }
+
+  document.getElementById('ci-spinner').style.display = 'block';
+  document.getElementById('ci-submit-btn').disabled    = true;
+
+  try {
+    const resp = await fetch('/api/activity/' + encodeURIComponent(_ciActivityId) + '/instructor', {
+      method:  'PUT',
+      headers: {
+        'Authorization': 'Bearer ' + BEARER_TOKEN,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({ instructor_email: email, instructor_name: name || null }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      errEl.textContent = typeof data.detail === 'string'
+        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status);
+      errEl.classList.add('visible');
+      return;
+    }
+    closeChangeInstructorModal();
+    await refreshActivities();
+  } catch (err) {
+    errEl.textContent = 'Network error: ' + err.message;
+    errEl.classList.add('visible');
+  } finally {
+    document.getElementById('ci-spinner').style.display = 'none';
+    document.getElementById('ci-submit-btn').disabled    = false;
+  }
+}
+
+// ── Add Instructor (admin only; server also enforces this) ─────────────
+
+function openAddInstructorModal() {
+  document.getElementById('ai-email').value = '';
+  document.getElementById('ai-name').value  = '';
+  document.getElementById('ai-error-banner').classList.remove('visible');
+  document.getElementById('ai-success-banner').classList.remove('visible');
+  document.getElementById('add-instructor-overlay').classList.add('open');
+  setTimeout(() => document.getElementById('ai-email').focus(), 50);
+}
+
+function closeAddInstructorModal() {
+  document.getElementById('add-instructor-overlay').classList.remove('open');
+}
+
+document.getElementById('add-instructor-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeAddInstructorModal();
+});
+
+async function submitAddInstructor() {
+  const email = document.getElementById('ai-email').value.trim();
+  const name  = document.getElementById('ai-name').value.trim();
+  const errEl = document.getElementById('ai-error-banner');
+  const okEl  = document.getElementById('ai-success-banner');
+  errEl.classList.remove('visible');
+  okEl.classList.remove('visible');
+
+  if (!email) {
+    errEl.textContent = 'Instructor email is required.';
+    errEl.classList.add('visible');
+    return;
+  }
+
+  document.getElementById('ai-spinner').style.display = 'block';
+  document.getElementById('ai-submit-btn').disabled    = true;
+
+  try {
+    const resp = await fetch('/api/instructor', {
+      method:  'POST',
+      headers: {
+        'Authorization': 'Bearer ' + BEARER_TOKEN,
+        'Content-Type':  'application/json',
+      },
+      body: JSON.stringify({ email: email, name: name || null }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      errEl.textContent = typeof data.detail === 'string'
+        ? data.detail : JSON.stringify(data.detail || 'Server error ' + resp.status);
+      errEl.classList.add('visible');
+      return;
+    }
+    okEl.textContent = 'Added ' + email + '. They can now sign in at /dashboard with Google.';
+    okEl.classList.add('visible');
+    document.getElementById('ai-email').value = '';
+    document.getElementById('ai-name').value  = '';
+  } catch (err) {
+    errEl.textContent = 'Network error: ' + err.message;
+    errEl.classList.add('visible');
+  } finally {
+    document.getElementById('ai-spinner').style.display = 'none';
+    document.getElementById('ai-submit-btn').disabled    = false;
+  }
 }"""
 
 
@@ -2466,44 +2812,156 @@ def _build_dashboard_script(safe_token: str, safe_email: str) -> str:
     return '<script>\n' + js + '\n</script>'
 
 
+def _admin_signin_page(error: str = None) -> str:
+    error_html = f'<p style="color:#c5221f;margin-top:16px">{html.escape(error)}</p>' if error else ''
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Admin Sign In – Instructor Dashboard</title>
+  <style>
+    body {{ display:flex; align-items:center; justify-content:center;
+           height:100vh; margin:0; font-family:Arial,sans-serif; background:#f4f6f8; }}
+    .card {{ text-align:center; background:white; padding:40px 48px;
+             border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.15); width:320px; }}
+    h2 {{ margin:0 0 24px; color:#1a73e8; }}
+    input[type="password"] {{
+      width:100%; padding:10px 12px; border:1px solid #ccc; border-radius:6px;
+      font-size:.95rem; margin-bottom:16px; box-sizing:border-box;
+    }}
+    button {{
+      width:100%; padding:10px 12px; background:#1a73e8; color:white; border:none;
+      border-radius:6px; font-size:.95rem; font-weight:600; cursor:pointer;
+    }}
+    button:hover {{ background:#1558b0; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>🔑 Admin Sign In</h2>
+    <form method="post" action="/admin/login">
+      <input type="password" name="password" placeholder="Admin password" required autofocus>
+      <button type="submit">Sign In</button>
+    </form>
+    {error_html}
+    <p style="margin-top:18px">
+      <a href="/dashboard" style="font-size:.85rem;color:#888">← Back to instructor sign-in</a>
+    </p>
+  </div>
+</body>
+</html>"""
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+async def admin_login_page(error: str = None):
+    """Username/password sign-in for the single admin account."""
+    return HTMLResponse(_admin_signin_page(error))
+
+
+@app.post("/admin/login")
+async def admin_login_submit(password: str = Form(...), db: Session = Depends(get_db)):
+    admin = db.query(Instructor).filter(Instructor.is_admin.is_(True)).first()
+    if not admin or not admin.password_hash or not verify_password(password, admin.password_hash):
+        return RedirectResponse(
+            url="/admin/login?error=" + _url_quote("Invalid password"),
+            status_code=303,
+        )
+    token = _make_admin_token()
+    response = RedirectResponse(url="/dashboard", status_code=303)
+    response.set_cookie(
+        "admin_token", token, httponly=True, samesite="lax",
+        max_age=ADMIN_SESSION_TTL_SECONDS,
+    )
+    return response
+
+
+@app.get("/admin/logout")
+async def admin_logout():
+    response = RedirectResponse(url="/dashboard", status_code=303)
+    response.delete_cookie("admin_token")
+    response.delete_cookie("google_token")
+    return response
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, token: str = None, db: Session = Depends(get_db)):
-    # ── Auth ──────────────────────────────────────────────────────────
-    # Accept token from either:
-    #   1. ?token=<jwt> query param  (used after Google Sign-In callback)
-    #   2. google_token cookie       (set on first successful load, fallback)
-    if not token:
-        token = request.cookies.get("google_token")
-    if not token:
-        return HTMLResponse(_signin_page())
+    # ── Admin session (username/password login) takes priority ─────────
+    admin_cookie = request.cookies.get("admin_token")
+    is_admin_view = bool(admin_cookie and _verify_admin_token(admin_cookie))
 
-    try:
-        claims = verify_google_token(token)
-    except Exception as exc:
-        logger.warning(f"[dashboard] token verification failed: {exc}")
-        return HTMLResponse(_signin_page(error=str(exc)))
-
-    email = claims.get("email", "")
-    instructor = db.query(Instructor).filter(
-        Instructor.email == email
-    ).first()
-    if not instructor:
-        return HTMLResponse(
-            "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
-            f"<h2>Access denied.</h2>"
-            f"<p><b>{email}</b> is not registered as an instructor.</p>"
-            "<p><a href='/dashboard'>Sign in with a different account</a></p>"
-            "</body></html>",
-            status_code=403,
+    if is_admin_view:
+        instructor = db.query(Instructor).filter(Instructor.is_admin.is_(True)).first()
+        if not instructor:
+            return HTMLResponse(
+                "<h2>Admin account not configured.</h2>"
+                "<p>Run <code>docker compose exec app python manage.py "
+                "set-admin-password</code> to create it.</p>",
+                status_code=500,
+            )
+        js_bearer_token = admin_cookie
+        display_name    = instructor.name or "Admin"
+        display_email   = instructor.email
+        cards_html = _build_activity_cards(
+            db.query(Activity).order_by(Activity.activity_name).all(),
+            db,
+            show_instructor_names=True,
         )
+    else:
+        # ── Auth ──────────────────────────────────────────────────────
+        # Accept token from either:
+        #   1. ?token=<jwt> query param  (used after Google Sign-In callback)
+        #   2. google_token cookie       (set on first successful load, fallback)
+        if not token:
+            token = request.cookies.get("google_token")
+        if not token:
+            return HTMLResponse(_signin_page())
 
-    cards_html = _build_activity_cards(instructor, db)
+        try:
+            claims = verify_google_token(token)
+        except Exception as exc:
+            logger.warning(f"[dashboard] token verification failed: {exc}")
+            return HTMLResponse(_signin_page(error=str(exc)))
+
+        email = claims.get("email", "")
+        instructor = db.query(Instructor).filter(
+            Instructor.email == email
+        ).first()
+        if not instructor:
+            return HTMLResponse(
+                "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
+                f"<h2>Access denied.</h2>"
+                f"<p><b>{html.escape(email)}</b> is not registered as an instructor.</p>"
+                "<p><a href='/dashboard'>Sign in with a different account</a></p>"
+                "</body></html>",
+                status_code=403,
+            )
+        js_bearer_token = token
+        display_name    = instructor.name or email
+        display_email   = email
+        cards_html = _build_activity_cards(instructor.activities, db)
 
     # Escape values that go into JS string literals
-    safe_token = token.replace("\\", "\\\\").replace("`", "\\`")
-    safe_email = email.replace("\\", "\\\\").replace("`", "\\`")
+    safe_token = js_bearer_token.replace("\\", "\\\\").replace("`", "\\`")
+    safe_email = display_email.replace("\\", "\\\\").replace("`", "\\`")
 
-    html = f"""<!DOCTYPE html>
+    admin_badge = (
+        ' <span style="background:#fbbc04;color:#3c2f00;font-size:.72rem;'
+        'font-weight:700;padding:1px 8px;border-radius:10px;vertical-align:middle">'
+        'ADMIN</span>'
+        if is_admin_view else ""
+    )
+    logout_html = (
+        '<a href="/admin/logout" style="color:white;font-size:.82rem;'
+        'text-decoration:underline">Log out</a>'
+        if is_admin_view else ""
+    )
+    add_instructor_btn_html = (
+        '<button class="btn-add-activity" onclick="openAddInstructorModal()">'
+        '➕ Add Instructor</button>'
+        if is_admin_view else ""
+    )
+
+    html_page = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -2521,7 +2979,9 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
     <button class="btn-add-activity" onclick="openModal()">
       ＋ Add Activity
     </button>
-    <span>{instructor.name or email}</span>
+    {add_instructor_btn_html}
+    <span>{display_name}{admin_badge}</span>
+    {logout_html}
   </div>
 </header>
 
@@ -2673,13 +3133,96 @@ async def dashboard(request: Request, token: str = None, db: Session = Depends(g
   </div>
 </div>
 
+<!-- ═══════════════════════════════════════════
+     Change Instructor dialog
+════════════════════════════════════════════ -->
+<div class="modal-overlay" id="change-instructor-overlay" role="dialog"
+     aria-modal="true" aria-labelledby="ci-title">
+  <div class="modal" style="width:420px">
+
+    <div class="modal-header">
+      <h2 id="ci-title">Change Instructor</h2>
+      <button class="modal-close" onclick="closeChangeInstructorModal()" aria-label="Close">&times;</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="error-banner" id="ci-error-banner"></div>
+      <p style="font-size:.85rem;color:#666;margin-top:0">
+        Current instructor(s): <span id="ci-current" style="font-weight:600"></span>
+      </p>
+      <div class="field">
+        <label for="ci-email">New Instructor Email <span class="req">*</span></label>
+        <input type="text" id="ci-email" placeholder="instructor@example.edu">
+      </div>
+      <div class="field">
+        <label for="ci-name">New Instructor Name <span style="color:#888;font-weight:400">(optional)</span></label>
+        <input type="text" id="ci-name" placeholder="Jane Doe">
+      </div>
+      <div class="hint">
+        This replaces the activity's current instructor assignment(s) with the
+        new instructor. If no instructor exists yet with that email, one is
+        created automatically.
+      </div>
+    </div>
+
+    <div class="modal-footer">
+      <div class="spinner" id="ci-spinner"></div>
+      <button class="btn-secondary" onclick="closeChangeInstructorModal()">Cancel</button>
+      <button class="btn-primary"   id="ci-submit-btn" onclick="submitChangeInstructor()">Change Instructor</button>
+    </div>
+
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════
+     Add Instructor dialog (admin only — the button that opens this is
+     hidden for non-admin sessions, but the server-side check in
+     POST /api/instructor is the real gate)
+════════════════════════════════════════════ -->
+<div class="modal-overlay" id="add-instructor-overlay" role="dialog"
+     aria-modal="true" aria-labelledby="ai-title">
+  <div class="modal" style="width:420px">
+
+    <div class="modal-header">
+      <h2 id="ai-title">Add Instructor</h2>
+      <button class="modal-close" onclick="closeAddInstructorModal()" aria-label="Close">&times;</button>
+    </div>
+
+    <div class="modal-body">
+      <div class="error-banner"   id="ai-error-banner"></div>
+      <div class="success-banner" id="ai-success-banner"></div>
+      <div class="field">
+        <label for="ai-email">Instructor Email <span class="req">*</span></label>
+        <input type="text" id="ai-email" placeholder="instructor@example.edu">
+      </div>
+      <div class="field">
+        <label for="ai-name">Instructor Name <span style="color:#888;font-weight:400">(optional)</span></label>
+        <input type="text" id="ai-name" placeholder="Jane Doe">
+      </div>
+      <div class="hint">
+        Creates an instructor account with no activities yet. Once added,
+        they can sign in at <code>/dashboard</code> with Google using this
+        email and create their own activities.
+      </div>
+    </div>
+
+    <div class="modal-footer">
+      <div class="spinner" id="ai-spinner"></div>
+      <button class="btn-secondary" onclick="closeAddInstructorModal()">Cancel</button>
+      <button class="btn-primary"   id="ai-submit-btn" onclick="submitAddInstructor()">Add Instructor</button>
+    </div>
+
+  </div>
+</div>
+
 {_build_dashboard_script(safe_token, safe_email)}
 
 </body>
 </html>"""
-    response = HTMLResponse(html)
-    # Persist token in a cookie so the user stays logged in across refreshes
-    response.set_cookie("google_token", token, httponly=True, samesite="lax")
+    response = HTMLResponse(html_page)
+    if not is_admin_view:
+        # Persist token in a cookie so the user stays logged in across refreshes
+        response.set_cookie("google_token", token, httponly=True, samesite="lax")
     return response
 
 
@@ -2710,8 +3253,9 @@ async def update_roster(
     if not activity:
         raise HTTPException(status_code=404, detail="Activity not found")
 
-    # Verify this instructor owns the activity
-    if activity not in instructor.activities:
+    # Verify this instructor owns the activity (the admin account bypasses
+    # this check and can update any activity's roster).
+    if not instructor.is_admin and activity not in instructor.activities:
         raise HTTPException(
             status_code=403,
             detail="You are not assigned to this activity",
@@ -2858,15 +3402,20 @@ async def update_roster(
 async def dashboard_cards(request: Request, db: Session = Depends(get_db)):
     """
     Return just the inner HTML for the activity cards belonging to the
-    authenticated instructor.  Called by the dashboard JS after a successful
-    roster upload to refresh the list without a full page reload.
+    authenticated instructor (or, for the admin account, every activity in
+    the system).  Called by the dashboard JS after a successful roster
+    upload / toggle / delete / instructor change to refresh the list
+    without a full page reload.
     """
     instructor = require_instructor(request, db)
-    return HTMLResponse(_build_activity_cards(instructor, db))
+    if instructor.is_admin:
+        activities = db.query(Activity).order_by(Activity.activity_name).all()
+        return HTMLResponse(_build_activity_cards(activities, db, show_instructor_names=True))
+    return HTMLResponse(_build_activity_cards(instructor.activities, db))
 
 
 def _signin_page(error: str = None) -> str:
-    error_html = f'<p style="color:red;margin-top:16px">{error}</p>' if error else ''
+    error_html = f'<p style="color:red;margin-top:16px">{html.escape(error)}</p>' if error else ''
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -2890,6 +3439,9 @@ def _signin_page(error: str = None) -> str:
          data-auto_prompt="false"></div>
     <div class="g_id_signin" data-type="standard"></div>
     {error_html}
+    <p style="margin-top:18px">
+      <a href="/admin/login" style="font-size:.85rem;color:#888">Admin sign-in</a>
+    </p>
   </div>
   <script>
     /*

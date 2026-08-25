@@ -18,7 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY models.py .
+COPY auth_utils.py .
 COPY main.py .
+COPY manage.py .
 
 # Copy grading engine and task graders
 COPY grading/ ./grading/
