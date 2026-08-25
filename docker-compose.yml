@@ -32,6 +32,11 @@ services:
     environment:
       DATABASE_URL: postgresql://activity_user:activity_pass@db:5432/activity_db
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}  # Set in .env file
+      # Signs admin dashboard sessions (see /admin/login). Set a long random
+      # value in your .env file — anyone who knows it can mint an admin
+      # session. After first `docker compose up`, set the admin password
+      # with: docker compose exec app python manage.py set-admin-password
+      ADMIN_SESSION_SECRET: ${ADMIN_SESSION_SECRET}
     ports:
       - "8100:8100"
     depends_on:
